@@ -79,6 +79,7 @@ os.environ["OPENAI_API_KEY"] = {Your_Private_Openai_Key}
 
 To replicate the performance reported in our paper, use GPT-4 and run validation with following configuration:
 ```bash
+# Linux or MacOS
 cd nav_src
 python NavGPT.py --llm_model_name gpt-4 \
     --output_dir ../datasets/R2R/exprs/gpt-4-val-unseen \
@@ -91,11 +92,19 @@ The defualt `--llm_model_name` is set as `gpt-3.5-turbo`.
 
 An economic way to try 🎇NavGPT is by using GPT-3.5 and run validation on the first 10 samples with following configuration:
 ```bash
+# Linux or MacOS
 cd nav_src
 python NavGPT.py --llm_model_name gpt-3.5-turbo \
     --output_dir ../datasets/R2R/exprs/gpt-3.5-turbo-test \
     --val_env_name R2R_val_unseen_instr \
     --iters 10
+
+# Windows
+cd nav_src
+python NavGPT.py --llm_model_name gpt-3.5-turbo `
+  --output_dir ../datasets/R2R/exprs/gpt-3.5-test `
+  --val_env_name R2R_val_unseen_instr `
+  --iters 10
 ```
 
 ### 🥢 Set up Custom LLMs for 🎇NavGPT

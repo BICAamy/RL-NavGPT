@@ -9,6 +9,7 @@ from utils.data import ImageObservationsDB
 from parser import parse_args
 from env import R2RNavBatch
 from agent import NavAgent
+from dotenv import load_dotenv
 
 def build_dataset(args):
 
@@ -93,6 +94,9 @@ def valid_from_file(args, val_envs):
             print(loss_str)
 
 def main():
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__),".."))
+    load_dotenv(os.path.join(project_root,".env"),override=False)
+
     args = parse_args()
 
     val_envs = build_dataset(args)

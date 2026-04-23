@@ -3,3 +3,4 @@ numpy
 openai==0.28.1
 transformers
 networkx
+python-dotenv
