@@ -1,6 +1,7 @@
 .ftpignore
 .ftpconfig
 .vscode
+.env
 
 # Byte-compiled / optimized / DLL files
 .ipynb_checkpoints/
