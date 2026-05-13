@@ -39,6 +39,7 @@ from prompt.planner_prompt import (
     VLN_ORCHESTRATOR_PROMPT,
     VLN_GPT4_PROMPT,
     VLN_GPT35_PROMPT,
+    get_prompt_set,
 )
 
 FINAL_ANSWER_ACTION = "Final Answer:"
@@ -157,23 +158,35 @@ class NavAgent(BaseAgent):
         super().__init__(env)
         self.config = config
 
-        if config.llm_model_name.split('-')[0] == 'gpt':
-            self.llm = OpenAI(
-                temperature=config.temperature,
-                model_name=config.llm_model_name,
-            )
-        elif config.llm_model_name == 'llama-2-13b':
-            from LLMs.Langchain_llama import Custom_Llama
-            ckpt_dir = "LLMs/llama/llama-2-13b"
-            tokenizer_path = "LLMs/llama/tokenizer.model"
-            self.llm = Custom_Llama.from_model_id(
-                temperature=config.temperature,
-                ckpt_dir = ckpt_dir,
-                tokenizer_path = tokenizer_path,
-                max_seq_len = 8000,
-                max_gen_len = 500,
-                max_batch_size = 1,
-            )
+        if config.llm_backend == 'openai':
+            self.prompt_set = get_prompt_set('plain')
+            if config.llm_model_name.split('-')[0] == 'gpt':
+                self.llm = OpenAI(
+                    temperature=config.temperature,
+                    model_name=config.llm_model_name,
+                )
+            elif config.llm_model_name == 'llama-2-13b':
+                from LLMs.Langchain_llama import Custom_Llama
+                ckpt_dir = "LLMs/llama/llama-2-13b"
+                tokenizer_path = "LLMs/llama/tokenizer.model"
+                self.llm = Custom_Llama.from_model_id(
+                    temperature=config.temperature,
+                    ckpt_dir = ckpt_dir,
+                    tokenizer_path = tokenizer_path,
+                    max_seq_len = 8000,
+                    max_gen_len = 500,
+                    max_batch_size = 1,
+                )
+            else:
+                raise ValueError(f"Unsupported llm_model_name for openai backend: {config.llm_model_name}")
+        elif config.llm_backend == 'hf':
+            self.prompt_set = get_prompt_set(config.local_chat_template)
+            self.llm = self._build_hf_llm()
+        elif config.llm_backend == 'gguf':
+            self.prompt_set = get_prompt_set(config.local_chat_template)
+            self.llm = self._build_gguf_llm()
+        else:
+            raise ValueError(f"Unsupported llm_backend: {config.llm_backend}")
         # elif config.llm_model_name == 'Vicuna-v1.5-13b':
         #     from LLMs.Langchain_Vicuna import Custom_Vicuna
         #     self.llm = Custom_Vicuna.from_config(
@@ -199,10 +212,66 @@ class NavAgent(BaseAgent):
         self.agent_executor = self.create_vln_agent()
 
         plan_prompt = PromptTemplate(
-            template=PLANNER_PROMPT,
+            template=self.prompt_set["planner"],
             input_variables=["instruction"],
         )
         self.plan_chain = LLMChain(llm=self.llm, prompt=plan_prompt)
+
+    def _build_hf_llm(self) -> BaseLanguageModel:
+        if not self.config.local_model_path:
+            raise ValueError("local_model_path is required when llm_backend=hf")
+        if self.config.local_model_path.endswith(".gguf"):
+            raise ValueError("GGUF models are not supported by transformers. Download a HF model or use a GGUF backend.")
+
+        from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+        import torch
+
+        dtype = torch.bfloat16 if self.config.local_dtype == "bf16" else torch.float16
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.config.local_model_path,
+            trust_remote_code=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            self.config.local_model_path,
+            torch_dtype=dtype,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+
+        text_gen = pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=tokenizer,
+            max_new_tokens=self.config.max_new_tokens,
+            do_sample=self.config.temperature > 0,
+            temperature=self.config.temperature,
+            top_p=self.config.top_p,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            return_full_text=False,
+        )
+        return HuggingFacePipeline(pipeline=text_gen)
+
+    def _build_gguf_llm(self) -> BaseLanguageModel:
+        if not self.config.local_model_path:
+            raise ValueError("local_model_path is required when llm_backend=gguf")
+        if not self.config.local_model_path.endswith(".gguf"):
+            raise ValueError("GGUF backend requires a .gguf model file")
+
+        from LLMs.gguf_llama import GGUF_Llama
+
+        n_threads = self.config.gguf_n_threads if self.config.gguf_n_threads > 0 else None
+        return GGUF_Llama.from_model_path(
+            model_path=self.config.local_model_path,
+            temperature=self.config.temperature,
+            top_p=self.config.top_p,
+            max_tokens=self.config.max_new_tokens,
+            n_ctx=self.config.gguf_n_ctx,
+            n_gpu_layers=self.config.gguf_n_gpu_layers,
+            n_threads=n_threads,
+        )
     
     def parse_action(self, llm_output: str) -> Tuple[str, str]:
         regex = r"(.*?)Final Answer:[\s]*(.*)"
@@ -351,11 +420,11 @@ class NavAgent(BaseAgent):
         """
 
         action_prompt = PromptTemplate(
-            template=ACTION_PROMPT,
+            template=self.prompt_set["action"],
             input_variables=["action_plan", "observation", "history", "navigable_viewpoints"],
         )
         history_prompt = PromptTemplate(
-            template=HISTORY_PROMPT,
+            template=self.prompt_set["history"],
             input_variables=["history", "previous_action", "observation"],
         )
         self.action_chain = LLMChain(llm=llm, prompt=action_prompt)
@@ -477,7 +546,7 @@ class NavAgent(BaseAgent):
         Using the LLM to find a viewpoint on the trajectory to back trace to.
         """
         prompt = PromptTemplate(
-            template=BACK_TRACE_PROMPT,
+            template=self.prompt_set["back_trace"],
             input_variables=["action_plan", "history", "observation"],
         )
 
@@ -575,7 +644,7 @@ class NavAgent(BaseAgent):
 
         if self.config.use_tool_chain:
             prompt = PromptTemplate(
-                template=VLN_ORCHESTRATOR_PROMPT,
+                template=self.prompt_set["vln_orchestrator"],
                 input_variables=["action_plan", "init_observation", "observation", "agent_scratchpad"],
                 partial_variables={
                     "tool_names": ", ".join([tool.name for tool in tools]),
@@ -587,7 +656,7 @@ class NavAgent(BaseAgent):
         elif self.config.use_single_action:
             tools = [self.action_maker]
             prompt = PromptTemplate(
-                template=VLN_GPT4_PROMPT if self.config.llm_model_name == 'gpt-4' else VLN_GPT35_PROMPT,
+                template=self.prompt_set["vln_gpt4"] if self.config.llm_model_name == 'gpt-4' else self.prompt_set["vln_gpt35"],
                 input_variables=["action_plan", "init_observation", "agent_scratchpad"],
                 partial_variables={
                     "tool_names": ", ".join([tool.name for tool in tools]),
@@ -598,7 +667,7 @@ class NavAgent(BaseAgent):
             )
         else:
             prompt = PromptTemplate(
-                template=VLN_ORCHESTRATOR_PROMPT,
+                template=self.prompt_set["vln_orchestrator"],
                 input_variables=["action_plan", "init_observation", "agent_scratchpad"],
                 partial_variables={
                     "tool_names": ", ".join([tool.name for tool in tools]),

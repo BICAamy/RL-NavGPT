@@ -278,3 +278,52 @@ Begin!
 Instruction: {action_plan}
 Initial Observation: {init_observation}
 Thought: I should start navigation according to the instruction, {agent_scratchpad}"""
+
+
+def _wrap_qwen_chat(user_prompt: str) -> str:
+    return (
+        "<|im_start|>system\n"
+        "You are a helpful assistant.\n"
+        "<|im_end|>\n"
+        "<|im_start|>user\n"
+        f"{user_prompt}\n"
+        "<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+
+
+PLANNER_PROMPT_QWEN = _wrap_qwen_chat(PLANNER_PROMPT)
+ACTION_PROMPT_QWEN = _wrap_qwen_chat(ACTION_PROMPT)
+HISTORY_PROMPT_QWEN = _wrap_qwen_chat(HISTORY_PROMPT)
+BACK_TRACE_PROMPT_QWEN = _wrap_qwen_chat(BACK_TRACE_PROMPT)
+VLN_ORCHESTRATOR_PROMPT_QWEN = _wrap_qwen_chat(VLN_ORCHESTRATOR_PROMPT)
+VLN_GPT4_PROMPT_QWEN = _wrap_qwen_chat(VLN_GPT4_PROMPT)
+VLN_GPT35_PROMPT_QWEN = _wrap_qwen_chat(VLN_GPT35_PROMPT)
+
+
+PROMPT_SETS = {
+    "plain": {
+        "planner": PLANNER_PROMPT,
+        "action": ACTION_PROMPT,
+        "history": HISTORY_PROMPT,
+        "back_trace": BACK_TRACE_PROMPT,
+        "vln_orchestrator": VLN_ORCHESTRATOR_PROMPT,
+        "vln_gpt4": VLN_GPT4_PROMPT,
+        "vln_gpt35": VLN_GPT35_PROMPT,
+    },
+    "qwen": {
+        "planner": PLANNER_PROMPT_QWEN,
+        "action": ACTION_PROMPT_QWEN,
+        "history": HISTORY_PROMPT_QWEN,
+        "back_trace": BACK_TRACE_PROMPT_QWEN,
+        "vln_orchestrator": VLN_ORCHESTRATOR_PROMPT_QWEN,
+        "vln_gpt4": VLN_GPT4_PROMPT_QWEN,
+        "vln_gpt35": VLN_GPT35_PROMPT_QWEN,
+    },
+}
+
+
+def get_prompt_set(chat_template: str) -> dict:
+    if chat_template == "qwen":
+        return PROMPT_SETS["qwen"]
+    return PROMPT_SETS["plain"]
