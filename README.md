@@ -49,13 +49,16 @@ conda activate NavGPT
 pip install -r requirements.txt
 ```
 
+For the later LoRA + GRPO training stage, install the additional training
+dependencies with `pip install -r requirements-train.txt`.
+
 ### 🍬 Data Preparation
 
 Download R2R data from [Dropbox](https://www.dropbox.com/sh/i8ng3iq5kpa68nu/AAB53bvCFY_ihYx1mkLlOB-ea?dl=1). Put the data in `datasets` directory.
 
 Related data preprocessing code can be found in `nav_src/scripts`.
 
-### 🍫 OpenAi API
+### 🍫 OpenAI API
 
 Get an [OpenAI API Key](https://platform.openai.com/account/api-keys) and add to your environment variables:
 
@@ -81,9 +84,12 @@ To replicate the performance reported in our paper, use GPT-4 and run validation
 ```bash
 # Linux or MacOS
 cd nav_src
-python NavGPT.py --llm_model_name gpt-4 \
+python NavGPT.py --llm_backend openai \
+    --llm_model_name gpt-4 \
+    --navigation_input_mode planner \
     --output_dir ../datasets/R2R/exprs/gpt-4-val-unseen \
-    --val_env_name R2R_val_unseen_instr
+    --val_env_name R2R_val_unseen_instr \
+    --iters -1
 ```
 
 Results will be saved in `datasets/R2R/exprs/gpt-4-val-unseen` directory.
@@ -94,35 +100,32 @@ An economic way to try 🎇NavGPT is by using GPT-3.5 and run validation on the 
 ```bash
 # Linux or MacOS
 cd nav_src
-python NavGPT.py --llm_model_name gpt-3.5-turbo \
+python NavGPT.py --llm_backend openai \
+    --llm_model_name gpt-3.5-turbo \
+    --navigation_input_mode planner \
     --output_dir ../datasets/R2R/exprs/gpt-3.5-turbo-test \
     --val_env_name R2R_val_unseen_instr \
     --iters 10
 
 # Windows
 cd nav_src
-python NavGPT.py --llm_model_name gpt-3.5-turbo `
+python NavGPT.py --llm_backend openai `
+  --llm_model_name gpt-3.5-turbo `
+  --navigation_input_mode planner `
   --output_dir ../datasets/R2R/exprs/gpt-3.5-test `
   --val_env_name R2R_val_unseen_instr `
   --iters 10
 ```
 
-### 🥢 Set up Custom LLMs for 🎇NavGPT
-Add your own model repo as a submodule under `nav_src/LLMs/`:
-```bash
-cd nav_src/LLMs
-git submodule add {Your_Model_Repo}
-```
-or just copy your local inference code under `nav_src/LLMs/`.
+### 🥢 Local HF and GGUF backends
 
-Follow the [instructions](nav_src/LLMs/Add_Custom_Models.md) to set up your own LLMs for 🎇NavGPT.
+The current code supports `--llm_backend openai`, `hf`, and `gguf`. All three
+use the same `<Think>/<Action>` navigation protocol. HF models use the
+tokenizer's native `apply_chat_template()`; GGUF models use llama.cpp chat
+completion or plain completion according to `--local_chat_template`.
 
-Run 🎇NavGPT with your custom LLM:
-```bash
-cd nav_src
-python NavGPT.py --llm_model_name your_custom_llm \
-    --output_dir ../datasets/R2R/exprs/your_custom_llm-test
-```
+See [docs/运行命令.md](docs/运行命令.md) for complete commands and
+[docs/parse中的参数解析.md](docs/parse中的参数解析.md) for CLI options.
 
 ## 🧃 Citation
 If 🎇`NavGPT` has been beneficial to your research and work, please cite our work using the following format:

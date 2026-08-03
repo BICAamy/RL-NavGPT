@@ -49,7 +49,8 @@ def valid(args, val_envs):
         agent.env = env
 
         start_time = time.time()
-        agent.test(iters=args.iters)
+        test_iters = None if args.iters < 0 else args.iters
+        agent.test(iters=test_iters)
         print(env_name, 'cost time: %.2fs' % (time.time() - start_time))
         # Get the results
         preds = agent.get_results(detailed_output=False)
@@ -79,19 +80,19 @@ def valid(args, val_envs):
 
 def valid_from_file(args, val_envs):
 
-    agent = NavAgent(next(iter(val_envs.values())), args)
     with open(args.valid_file, 'r') as f:
         preds = json.load(f)
 
     for env_name, env in val_envs.items():
-        agent.env = env
-        valid_list = [preds]
-        for valid_pred in valid_list:
-            score_summary, _ = env.eval_metrics(valid_pred)
-            loss_str = "Env name: %s, length %d" % (env_name, len(valid_pred))
-            for metric, val in score_summary.items():
-                loss_str += ', %s: %.2f' % (metric, val)
-            print(loss_str)
+
+        score_summary, _ = env.eval_metrics(preds)
+
+        loss_str = f"Env name: {env_name}, length {len(preds)}"
+
+        for metric, val in score_summary.items():
+            loss_str += f", {metric}: {val:.2f}"
+
+        print(loss_str)
 
 def main():
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__),".."))

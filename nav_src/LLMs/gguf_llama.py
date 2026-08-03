@@ -14,6 +14,11 @@ class GGUF_Llama(LLM):
     n_ctx: int = 2048
     n_gpu_layers: int = 0
     n_threads: Optional[int] = None
+    chat_template: str = "auto"
+    system_prompt: str = (
+        "You are a helpful assistant for embodied navigation. Follow the "
+        "format requested in the user prompt exactly."
+    )
 
     @property
     def _llm_type(self) -> str:
@@ -29,6 +34,7 @@ class GGUF_Llama(LLM):
         n_ctx: int = 2048,
         n_gpu_layers: int = 0,
         n_threads: Optional[int] = None,
+        chat_template: str = "auto",
         **kwargs: Any,
     ) -> LLM:
         try:
@@ -36,12 +42,15 @@ class GGUF_Llama(LLM):
         except ImportError as exc:
             raise ImportError("llama-cpp-python is required for gguf backend") from exc
 
-        model = Llama(
+        model_kwargs = dict(
             model_path=model_path,
             n_ctx=n_ctx,
             n_gpu_layers=n_gpu_layers,
             n_threads=n_threads,
         )
+        if chat_template == "qwen":
+            model_kwargs["chat_format"] = "chatml"
+        model = Llama(**model_kwargs)
 
         return cls(
             model=model,
@@ -52,6 +61,7 @@ class GGUF_Llama(LLM):
             n_ctx=n_ctx,
             n_gpu_layers=n_gpu_layers,
             n_threads=n_threads,
+            chat_template=chat_template,
             **kwargs,
         )
 
@@ -61,14 +71,24 @@ class GGUF_Llama(LLM):
         stop: Optional[List[str]] = None,
         run_manager: Optional[CallbackManagerForLLMRun] = None,
     ) -> str:
-        result = self.model(
-            prompt,
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            stop=stop,
+        generation_kwargs = {
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "stop": stop,
+        }
+        if self.chat_template == "plain":
+            result = self.model(prompt, **generation_kwargs)
+            return result["choices"][0]["text"].strip()
+
+        result = self.model.create_chat_completion(
+            messages=[
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            **generation_kwargs,
         )
-        return result["choices"][0]["text"]
+        return result["choices"][0]["message"]["content"].strip()
 
     @property
     def _identifying_params(self) -> Mapping[str, Any]:
@@ -80,4 +100,5 @@ class GGUF_Llama(LLM):
             "n_ctx": self.n_ctx,
             "n_gpu_layers": self.n_gpu_layers,
             "n_threads": self.n_threads,
+            "chat_template": self.chat_template,
         }

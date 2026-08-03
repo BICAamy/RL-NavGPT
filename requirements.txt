@@ -1,6 +1,9 @@
 langchain==0.0.246
-numpy
+numpy<2
 openai==0.28.1
-transformers
+transformers>=4.37,<6
+torch
+accelerate
+llama-cpp-python
 networkx
 python-dotenv

@@ -1,0 +1,11 @@
+-r requirements.txt
+
+# Stage 3: LoRA + GRPO training
+transformers>=5.2,<6
+datasets
+gymnasium
+peft
+trl
+
+# Stage 2 reward models
+Pillow

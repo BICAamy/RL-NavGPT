@@ -2,7 +2,7 @@ import argparse
 import os
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="")
 
     # datasets
@@ -16,8 +16,22 @@ def parse_args():
     parser.add_argument('--temperature', type=float, default=0.0, help='temperature for llm')
     parser.add_argument('--llm_model_name', type=str, default='gpt-3.5-turbo', help='llm model name')
     parser.add_argument('--llm_backend', type=str, default='openai', choices=['openai', 'hf', 'gguf'], help='llm backend')
-    parser.add_argument('--local_model_path', type=str, default='', help='local hf model path')
-    parser.add_argument('--local_chat_template', type=str, default='qwen', choices=['plain', 'qwen'], help='chat template for local models')
+    parser.add_argument(
+        '--local_model_path',
+        type=str,
+        default='',
+        help='HF model directory or GGUF model file path',
+    )
+    parser.add_argument(
+        '--local_chat_template',
+        type=str,
+        default='qwen',
+        choices=['auto', 'plain', 'qwen'],
+        help=(
+            'local chat rendering: HF uses tokenizer.apply_chat_template for '
+            'auto/qwen; GGUF uses model metadata for auto or ChatML for qwen'
+        ),
+    )
     parser.add_argument('--local_dtype', type=str, default='bf16', choices=['bf16', 'fp16'], help='dtype for local models')
     parser.add_argument('--top_p', type=float, default=0.9, help='top_p for local models')
     parser.add_argument('--max_new_tokens', type=int, default=512, help='max new tokens for local models')
@@ -30,9 +44,19 @@ def parse_args():
     parser.add_argument('--max_iterations', type=int, default=10)
 
     # General config
-    parser.add_argument('--iters', type=int, default=10, help='number of iterations to run')
+    parser.add_argument(
+        '--iters',
+        type=int,
+        default=10,
+        help='number of episodes to run; use -1 to evaluate the complete split',
+    )
     # parser.add_argument('--iters', type=int, default=None, help='number of iterations to run')
-    parser.add_argument('--max_scratchpad_length', type=int, default=1000, help='max number of steps in an episode')
+    parser.add_argument(
+        '--max_scratchpad_length',
+        type=int,
+        default=7000,
+        help='maximum number of recent scratchpad characters kept in the prompt',
+    )
     parser.add_argument('--test', action='store_true', default=False)
     # parser.add_argument('--val_env_name', type=str, default='R2R_val_unseen_instr_0')
     # parser.add_argument('--val_env_name', type=str, default='R2R_val_unseen_instr_1')
@@ -41,21 +65,73 @@ def parse_args():
     # parser.add_argument('--val_env_name', type=str, default='R2R_val_unseen_instr_4')
     parser.add_argument('--val_env_name', type=str, default='R2R_val_unseen_instr')
 
-    parser.add_argument('--load_instruction', action='store_true', default=True)
-    parser.add_argument('--load_action_plan', action='store_true', default=True)
+    input_mode = parser.add_mutually_exclusive_group()
+    input_mode.add_argument(
+        '--navigation_input_mode',
+        choices=['planner', 'instruction', 'action_plan'],
+        help=(
+            'planner (default): generate an action plan with the selected LLM; '
+            'instruction: use the raw R2R instruction; action_plan: read an '
+            'action_plan field from annotations'
+        ),
+    )
+    input_mode.add_argument(
+        '--load_instruction',
+        dest='navigation_input_mode',
+        action='store_const',
+        const='instruction',
+        help='deprecated alias for --navigation_input_mode instruction',
+    )
+    input_mode.add_argument(
+        '--load_action_plan',
+        dest='navigation_input_mode',
+        action='store_const',
+        const='action_plan',
+        help='deprecated alias for --navigation_input_mode action_plan',
+    )
+    parser.set_defaults(navigation_input_mode='planner')
 
-    parser.add_argument('--use_relative_angle', action='store_true', default=True)
-    parser.add_argument('--use_history_chain', action='store_true', default=False)
-    parser.add_argument('--use_tool_chain', action='store_true', default=False)
-    parser.add_argument('--use_navigable', action='store_true', default=False)
-    parser.add_argument('--use_single_action', action='store_true', default=True)
+    parser.add_argument(
+        '--use_relative_angle',
+        '--use-relative-angle',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        '--use_history_chain',
+        '--use-history-chain',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        '--use_tool_chain',
+        '--use-tool-chain',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        '--use_navigable',
+        '--use-navigable',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        '--use_single_action',
+        '--use-single-action',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
 
-    parser.add_argument('--detailed_output', action='store_true', default=True)
+    parser.add_argument(
+        '--detailed_output',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
 
     # parser.add_argument('--valid_file', type=str, default='../datasets/R2R/exprs/4-R2R_val_unseen_instr/4-R2R_val_unseen_instr.json', help='valid file name')
     parser.add_argument('--valid_file', type=str, default=None, help='valid file name')
 
-    args, _ = parser.parse_known_args()
+    args = parser.parse_args(argv)
 
     args = postprocess_args(args)
 
@@ -85,4 +161,3 @@ def postprocess_args(args):
     os.makedirs(args.pred_dir, exist_ok=True)
 
     return args
-

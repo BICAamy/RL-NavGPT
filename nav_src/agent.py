@@ -1,111 +1,74 @@
 """Agent that interacts with Matterport3D simulator via a hierarchical planning approach."""
-import json
-import yaml
-import re
-import warnings
 import numpy as np
-from typing import Any, Callable, List, NamedTuple, Optional, Sequence, Tuple, Dict, Union
+from typing import Any, List, Optional, Tuple, Dict, Union
 
 from env import R2RNavBatch
 from argparse import Namespace
 from agent_base import BaseAgent
 
-from langchain import HuggingFacePipeline
-from langchain.agents.agent import AgentExecutor, AgentAction, AgentOutputParser
+from langchain.agents.agent import AgentExecutor, AgentOutputParser
 from langchain.agents.mrkl.base import ZeroShotAgent
 from langchain.agents.tools import Tool
 from langchain.chains import LLMChain
+from langchain.chat_models import ChatOpenAI
 from langchain.llms.openai import OpenAI
 from langchain.prompts import PromptTemplate
 from langchain.schema import (
     AgentAction,
     AgentFinish,
     BaseMessage,
-    BaseOutputParser,
     OutputParserException
 )
 from langchain.base_language import BaseLanguageModel
 
-from langchain.agents.mrkl.prompt import FORMAT_INSTRUCTIONS
+from policy_output import (
+    FINISH_ACTION,
+    PolicyOutputParseError,
+    parse_policy_output,
+)
 from prompt.planner_prompt import (
-    ACTION_PROMPT,
-    HISTORY_PROMPT,
-    PLANNER_PROMPT,
-    BACK_TRACE_PROMPT,
     MAKE_ACTION_TOOL_NAME,
     MAKE_ACTION_TOOL_DESCRIPTION,
     BACK_TRACE_TOOL_NAME,
     BACK_TRACE_TOOL_DESCRIPTION,
-    VLN_ORCHESTRATOR_PROMPT,
-    VLN_GPT4_PROMPT,
-    VLN_GPT35_PROMPT,
     get_prompt_set,
 )
 
-FINAL_ANSWER_ACTION = "Final Answer:"
-EXCEPTION_TOOL_NAME = "_Exception"
 MAX_SCRATCHPAD_LENGTH = 7000
-
-MISSING_ACTION_AFTER_THOUGHT_ERROR_MESSAGE = (
-    "Invalid Format: Missing 'Action:' after 'Thought:"
-)
-MISSING_ACTION_INPUT_AFTER_ACTION_ERROR_MESSAGE = (
-    "Invalid Format: Missing 'Action Input:' after 'Action:'"
-)
-FINAL_ANSWER_AND_PARSABLE_ACTION_ERROR_MESSAGE = (
-    "Parsing LLM output produced both a final answer and a parse-able action:"
-)
 
 
 class NavGPTOutputParser(AgentOutputParser):
-    """MRKL Output parser for the chat agent."""
+    """Adapt the canonical Think/Action protocol to LangChain agent actions."""
 
     def get_format_instructions(self) -> str:
-        return FORMAT_INSTRUCTIONS
+        return (
+            '<Think>reasoning</Think>\n'
+            '<Action>action_maker("32-character viewpoint ID")</Action> '
+            "or <Action>Finish!</Action>"
+        )
 
     def parse(self, text: str) -> Union[AgentAction, AgentFinish]:
-        includes_answer = FINAL_ANSWER_ACTION in text
-        regex = (
-            r"Action\s*\d*\s*:[\s]*(.*?)[\s]*Action\s*\d*\s*Input\s*\d*\s*:[\s]*\"?([a-fA-F0-9]{32})\"?"
-        )
-        action_match = re.search(regex, text, re.DOTALL)
-        if action_match:
-            if includes_answer:
-                raise OutputParserException(
-                    f"{FINAL_ANSWER_AND_PARSABLE_ACTION_ERROR_MESSAGE}: {text}"
-                )
-            action = action_match.group(1).strip()
-            action_input = action_match.group(2)
-            tool_input = action_input.strip(" ")
-            # ensure if its a well formed SQL query we don't remove any trailing " chars
-            if tool_input.startswith("SELECT ") is False:
-                tool_input = tool_input.strip('"')
+        try:
+            output = parse_policy_output(text)
+        except PolicyOutputParseError as exc:
+            raise OutputParserException(
+                f"Could not parse LLM output: `{text}`",
+                observation=(
+                    f"Invalid navigation output: {exc} Output exactly one "
+                    "<Think>...</Think> block followed by one "
+                    "<Action>...</Action> block."
+                ),
+                llm_output=text,
+                send_to_llm=True,
+            ) from exc
 
-            return AgentAction(action, tool_input, text)
-
-        elif includes_answer:
+        if output.is_finish:
             return AgentFinish(
-                {"output": text.split(FINAL_ANSWER_ACTION)[-1].strip()}, text
+                {"output": FINISH_ACTION},
+                text,
             )
 
-        if not re.search(r"Action\s*\d*\s*:[\s]*(.*?)", text, re.DOTALL):
-            raise OutputParserException(
-                f"Could not parse LLM output: `{text}`",
-                observation=MISSING_ACTION_AFTER_THOUGHT_ERROR_MESSAGE,
-                llm_output=text,
-                send_to_llm=True,
-            )
-        elif not re.search(
-            r"[\s]*Action\s*\d*\s*Input\s*\d*\s*:[\s]*(.*)", text, re.DOTALL
-        ):
-            raise OutputParserException(
-                f"Could not parse LLM output: `{text}`",
-                observation=MISSING_ACTION_INPUT_AFTER_ACTION_ERROR_MESSAGE,
-                llm_output=text,
-                send_to_llm=True,
-            )
-        else:
-            raise OutputParserException(f"Could not parse LLM output: `{text}`")
+        return AgentAction(output.action_name, output.viewpoint_id, text)
 
     @property
     def _type(self) -> str:
@@ -114,6 +77,13 @@ class NavGPTOutputParser(AgentOutputParser):
 class VLNAgent(ZeroShotAgent):
 
     history: Optional[List[str]] = None 
+    max_scratchpad_length: int = MAX_SCRATCHPAD_LENGTH
+
+    @property
+    def llm_prefix(self) -> str:
+        """Prompt prefix used after every tool observation."""
+
+        return "Decision:"
 
     def _construct_scratchpad(
         self, intermediate_steps: List[Tuple[AgentAction, str]]
@@ -134,7 +104,9 @@ class VLNAgent(ZeroShotAgent):
         self, intermediate_steps: List[Tuple[AgentAction, str]], **kwargs: Any
     ) -> Dict[str, Any]:
         """Create the full inputs for the LLMChain from intermediate steps."""
-        thoughts = self._construct_scratchpad(intermediate_steps)[-MAX_SCRATCHPAD_LENGTH:]
+        thoughts = self._construct_scratchpad(intermediate_steps)[
+            -self.max_scratchpad_length:
+        ]
         new_inputs = {"agent_scratchpad": thoughts, "stop": self._stop}
         if len(intermediate_steps) == 0:
             full_inputs = {**kwargs, **new_inputs}
@@ -161,10 +133,19 @@ class NavAgent(BaseAgent):
         if config.llm_backend == 'openai':
             self.prompt_set = get_prompt_set('plain')
             if config.llm_model_name.split('-')[0] == 'gpt':
-                self.llm = OpenAI(
-                    temperature=config.temperature,
-                    model_name=config.llm_model_name,
-                )
+                if (
+                    "turbo" in config.llm_model_name
+                    and "instruct" not in config.llm_model_name
+                ) or config.llm_model_name.startswith("gpt-4"):
+                    self.llm = ChatOpenAI(
+                        temperature=config.temperature,
+                        model_name=config.llm_model_name,
+                    )
+                else:
+                    self.llm = OpenAI(
+                        temperature=config.temperature,
+                        model_name=config.llm_model_name,
+                    )
             elif config.llm_model_name == 'llama-2-13b':
                 from LLMs.Langchain_llama import Custom_Llama
                 ckpt_dir = "LLMs/llama/llama-2-13b"
@@ -180,10 +161,10 @@ class NavAgent(BaseAgent):
             else:
                 raise ValueError(f"Unsupported llm_model_name for openai backend: {config.llm_model_name}")
         elif config.llm_backend == 'hf':
-            self.prompt_set = get_prompt_set(config.local_chat_template)
+            self.prompt_set = get_prompt_set('plain')
             self.llm = self._build_hf_llm()
         elif config.llm_backend == 'gguf':
-            self.prompt_set = get_prompt_set(config.local_chat_template)
+            self.prompt_set = get_prompt_set('plain')
             self.llm = self._build_gguf_llm()
         else:
             raise ValueError(f"Unsupported llm_backend: {config.llm_backend}")
@@ -223,36 +204,18 @@ class NavAgent(BaseAgent):
         if self.config.local_model_path.endswith(".gguf"):
             raise ValueError("GGUF models are not supported by transformers. Download a HF model or use a GGUF backend.")
 
-        from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
         import torch
+        from LLMs.hf_chat import HuggingFaceChatLLM
 
         dtype = torch.bfloat16 if self.config.local_dtype == "bf16" else torch.float16
-        tokenizer = AutoTokenizer.from_pretrained(
-            self.config.local_model_path,
-            trust_remote_code=True,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            self.config.local_model_path,
-            torch_dtype=dtype,
-            device_map="auto",
-            trust_remote_code=True,
-        )
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-
-        text_gen = pipeline(
-            "text-generation",
-            model=model,
-            tokenizer=tokenizer,
-            max_new_tokens=self.config.max_new_tokens,
-            do_sample=self.config.temperature > 0,
+        return HuggingFaceChatLLM.from_model_path(
+            model_path=self.config.local_model_path,
+            dtype=dtype,
+            chat_template=self.config.local_chat_template,
             temperature=self.config.temperature,
             top_p=self.config.top_p,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            return_full_text=False,
+            max_new_tokens=self.config.max_new_tokens,
         )
-        return HuggingFacePipeline(pipeline=text_gen)
 
     def _build_gguf_llm(self) -> BaseLanguageModel:
         if not self.config.local_model_path:
@@ -271,18 +234,13 @@ class NavAgent(BaseAgent):
             n_ctx=self.config.gguf_n_ctx,
             n_gpu_layers=self.config.gguf_n_gpu_layers,
             n_threads=n_threads,
+            chat_template=self.config.local_chat_template,
         )
     
     def parse_action(self, llm_output: str) -> Tuple[str, str]:
-        regex = r"(.*?)Final Answer:[\s]*(.*)"
-        match = re.search(regex, llm_output, re.DOTALL)
-        if not match:
-            raise ValueError(f"Could not parse LLM output: `{llm_output}`")
-
-        thought = match.group(1).strip()
-        action = match.group(2).strip(" ").strip('"').strip("'")
-
-        return thought, action
+        output = parse_policy_output(llm_output)
+        action = FINISH_ACTION if output.is_finish else output.viewpoint_id
+        return output.thought, action
 
     def get_his_viewpoints(self) -> str:
         '''Return the history of visited viewpoints for back tracing.'''
@@ -644,7 +602,7 @@ class NavAgent(BaseAgent):
 
         if self.config.use_tool_chain:
             prompt = PromptTemplate(
-                template=self.prompt_set["vln_orchestrator"],
+                template=self.prompt_set["vln_orchestrator_tool"],
                 input_variables=["action_plan", "init_observation", "observation", "agent_scratchpad"],
                 partial_variables={
                     "tool_names": ", ".join([tool.name for tool in tools]),
@@ -679,7 +637,8 @@ class NavAgent(BaseAgent):
         agent = VLNAgent(
             llm_chain=LLMChain(llm=self.llm, prompt=prompt),
             allowed_tools=[tool.name for tool in tools],
-            output_parser = self.output_parser
+            output_parser=self.output_parser,
+            max_scratchpad_length=self.config.max_scratchpad_length,
         )
         return AgentExecutor.from_agent_and_tools(
             agent=agent, 
@@ -690,7 +649,7 @@ class NavAgent(BaseAgent):
             max_iterations=self.config.max_iterations,
         )
     
-    def make_equiv_action(self, actions: List[str]) -> str:
+    def make_equiv_action(self, actions: List[str]) -> Tuple[str, dict]:
         """
         Interface between Panoramic view and Egocentric view
         Take in the next viewpoint ID and move the agent to that viewpoint
@@ -733,9 +692,15 @@ class NavAgent(BaseAgent):
 
         # Load the instruction
         instructions = [ob['instruction'] for ob in obs]
-        if self.config.load_instruction:
+        if self.config.navigation_input_mode == 'instruction':
             action_plans = instructions
-        elif self.config.load_action_plan:
+        elif self.config.navigation_input_mode == 'action_plan':
+            missing = [ob['instr_id'] for ob in obs if 'action_plan' not in ob]
+            if missing:
+                raise ValueError(
+                    "navigation_input_mode=action_plan requires an 'action_plan' "
+                    f"field in every annotation; missing for {missing[:3]}"
+                )
             action_plans = [ob['action_plan'] for ob in obs]
         else:
             action_plans = []

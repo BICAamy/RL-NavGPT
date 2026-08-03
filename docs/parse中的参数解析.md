@@ -1,32 +1,57 @@
-- `--llm_backend`：选择使用哪种模型后端  
-  - `openai`：在线 API（原版）  
-  - `hf`：本地 HF safetensors  
-  - `gguf`：本地 GGUF（llama.cpp）
+# parser.py 参数说明
 
-- `--local_model_path`：本地模型路径  
-  - HF 模型：是目录  
-  - GGUF：是 `.gguf` 文件路径
+## 模型后端
 
-- `--local_chat_template`：Prompt 模板类型  
-  - `plain`：原始纯文本  
-  - `qwen`：Qwen 专用 `<|im_start|>` Chat 模板
+- `--llm_backend {openai,hf,gguf}`
+  - `openai`：在线 OpenAI completion 接口，使用后端中性的 Prompt。
+  - `hf`：Hugging Face causal LM，使用 tokenizer 的
+    `apply_chat_template()`。
+  - `gguf`：`llama.cpp` 本地模型，使用 chat completion 或原始
+    completion。
+- `--llm_model_name`：实验记录和在线模型名称。
+- `--local_model_path`：HF 模型目录或 GGUF 文件路径。
+- `--local_chat_template {auto,qwen,plain}`
+  - `auto`：HF 使用 tokenizer 模板；GGUF 使用模型元数据。
+  - `qwen`：HF 仍使用 tokenizer 模板；GGUF 显式使用 ChatML。
+  - `plain`：不套聊天模板，仅用于原始 completion 模型。
+- `--local_dtype {bf16,fp16}`：HF 权重精度。
+- `--temperature`、`--top_p`、`--max_new_tokens`：生成参数。
+- `--gguf_n_ctx`、`--gguf_n_gpu_layers`、`--gguf_n_threads`：
+  `llama.cpp` 参数。
 
-- `--local_dtype`：HF 本地模型的精度  
-  - `bf16` / `fp16`（仅 HF 生效，GGUF 不用）
+## 导航状态输入
 
-- `--top_p`：采样的“概率截断”上限  
-  - 控制生成的多样性，越小越保守
+- `--navigation_input_mode {planner,instruction,action_plan}`
+  - `planner`：默认。先用当前模型根据原始 instruction 生成 action
+    plan，再用该 plan 导航。
+  - `instruction`：跳过 planner，直接使用 R2R 原始 instruction。
+  - `action_plan`：从 annotation 的 `action_plan` 字段读取；原始 R2R
+    文件没有此字段。
 
-- `--max_new_tokens`：每次生成的最大 token 数  
-  - 太大速度慢，太小可能截断
+旧参数 `--load_instruction` 和 `--load_action_plan` 暂时保留为兼容
+别名，但新实验应使用 `--navigation_input_mode`。
 
-- `--gguf_n_ctx`：GGUF 的上下文长度（KV cache）  
-  - 越大越吃内存
+训练和推理必须使用同一种模式。当前项目与后续 RL 方案默认选择
+`planner`，从而保证零样本基线、轨迹收集和 LoRA 推理输入一致。
 
-- `--gguf_n_gpu_layers`：GGUF 的 GPU 层数  
-  - Metal / CUDA 加速的层数，越大越快但更吃显存
+## 运行范围
 
-- `--gguf_n_threads`：GGUF 的 CPU 线程数  
-  - 0=自动，适合本机 CPU 核数
+- `--iters N`：运行 N 个 episode。
+- `--iters -1`：遍历完整验证 split。
+- `--val_env_name`：验证集名称。
+- `--output_dir`：日志、详细输出和预测文件目录。
+- `--valid_file`：不加载 LLM，仅评测已有预测 JSON。
 
-如果你需要，我可以再给你一份**“推荐默认值”配置表（mac / A100 版）**。
+## 布尔选项
+
+布尔参数同时支持开启和关闭。例如：
+
+```bash
+--use-relative-angle
+--no-use-relative-angle
+--use-navigable
+--no-use-navigable
+```
+
+下划线形式继续兼容。命令行现在严格检查未知参数，拼写错误不会再被
+静默忽略。
