@@ -15,6 +15,9 @@
   - `qwen`：HF 仍使用 tokenizer 模板；GGUF 显式使用 ChatML。
   - `plain`：不套聊天模板，仅用于原始 completion 模型。
 - `--local_dtype {bf16,fp16}`：HF 权重精度。
+- `--hf_device_map {single,auto}`：HF 放置方式。论文主实验使用默认的
+  `single`，并通过 `CUDA_VISIBLE_DEVICES` 为每个进程只暴露一张卡；
+  `auto` 可能跨卡切层，不用于当前已经验证的 Qwen14B 路径。
 - `--temperature`、`--top_p`、`--max_new_tokens`：生成参数。
 - `--gguf_n_ctx`、`--gguf_n_gpu_layers`、`--gguf_n_threads`：
   `llama.cpp` 参数。
@@ -25,14 +28,18 @@
   - `planner`：默认。先用当前模型根据原始 instruction 生成 action
     plan，再用该 plan 导航。
   - `instruction`：跳过 planner，直接使用 R2R 原始 instruction。
-  - `action_plan`：从 annotation 的 `action_plan` 字段读取；原始 R2R
-    文件没有此字段。
+  - `action_plan`：通过 `--action_plan_cache` 指定合并后的 Planner JSONL，
+    按 `instr_id` 读取缓存；原始 R2R annotation 保持不变。
+- `--action_plan_cache PATH`：`action_plan` 模式必填。缓存中的
+  `instr_id` 和 instruction 必须与当前 split 完整匹配，否则立即报错。
 
 旧参数 `--load_instruction` 和 `--load_action_plan` 暂时保留为兼容
 别名，但新实验应使用 `--navigation_input_mode`。
 
-训练和推理必须使用同一种模式。当前项目与后续 RL 方案默认选择
-`planner`，从而保证零样本基线、轨迹收集和 LoRA 推理输入一致。
+零样本在线基线使用 `planner`；正式训练和训练后主实验统一使用
+`action_plan`。缓存由相同模型、Prompt、Chat Template 和 greedy 解码
+生成，并通过抽样逐字符复核，因此两种路径送入 Policy 的 action plan
+内容一致，同时训练期间的状态不会随 LoRA 更新而漂移。
 
 ## 运行范围
 

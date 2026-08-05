@@ -33,6 +33,7 @@ from prompt.planner_prompt import (
     BACK_TRACE_TOOL_DESCRIPTION,
     get_prompt_set,
 )
+from planner import build_planner_chain, generate_action_plan
 
 MAX_SCRATCHPAD_LENGTH = 7000
 
@@ -192,11 +193,7 @@ class NavAgent(BaseAgent):
         self.output_parser = NavGPTOutputParser()
         self.agent_executor = self.create_vln_agent()
 
-        plan_prompt = PromptTemplate(
-            template=self.prompt_set["planner"],
-            input_variables=["instruction"],
-        )
-        self.plan_chain = LLMChain(llm=self.llm, prompt=plan_prompt)
+        self.plan_chain = build_planner_chain(self.llm)
 
     def _build_hf_llm(self) -> BaseLanguageModel:
         if not self.config.local_model_path:
@@ -211,6 +208,7 @@ class NavAgent(BaseAgent):
         return HuggingFaceChatLLM.from_model_path(
             model_path=self.config.local_model_path,
             dtype=dtype,
+            device_map=self.config.hf_device_map,
             chat_template=self.config.local_chat_template,
             temperature=self.config.temperature,
             top_p=self.config.top_p,
@@ -698,14 +696,14 @@ class NavAgent(BaseAgent):
             missing = [ob['instr_id'] for ob in obs if 'action_plan' not in ob]
             if missing:
                 raise ValueError(
-                    "navigation_input_mode=action_plan requires an 'action_plan' "
-                    f"field in every annotation; missing for {missing[:3]}"
+                    "navigation_input_mode=action_plan requires a cached plan "
+                    f"for every instruction; missing for {missing[:3]}"
                 )
             action_plans = [ob['action_plan'] for ob in obs]
         else:
             action_plans = []
             for instruction in instructions:
-                action_plan = self.plan_chain.run(instruction = instruction)
+                action_plan = generate_action_plan(self.plan_chain, instruction)
                 action_plans.append(action_plan)
 
         for i, init_ob in enumerate(obs):

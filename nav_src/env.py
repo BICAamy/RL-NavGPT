@@ -215,7 +215,6 @@ class R2RNavBatch(object):
                 'obs_summary' : feature["summary"],
                 'objects' : feature["objects"],
                 'instr_id' : item['instr_id'],
-                # 'action_plan' : item['action_plan'],
                 'scan' : state['scanID'],
                 'viewpoint' : state['viewpointID'],
                 'heading' : state['heading'],
@@ -225,6 +224,9 @@ class R2RNavBatch(object):
                 'gt_path' : item['path'],
                 'path_id' : item['path_id']
             }
+            if 'action_plan' in item:
+                ob['action_plan'] = item['action_plan']
+                ob['planner_fingerprint'] = item.get('planner_fingerprint')
             # RL reward. The negative distance between the state and the final state
             # There are multiple gt end viewpoints on REVERIE. 
             if ob['instr_id'] in self.gt_trajs:

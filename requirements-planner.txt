@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Frozen Qwen2.5-14B Planner environment validated on the Blackwell server.
+transformers==4.48.3

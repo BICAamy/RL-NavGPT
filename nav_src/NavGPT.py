@@ -22,7 +22,14 @@ def build_dataset(args):
     val_envs = {}
     for split in val_env_names:
         val_instr_data = construct_instrs(
-            args.anno_dir, args.dataset, [split]
+            args.anno_dir,
+            args.dataset,
+            [split],
+            action_plan_cache=(
+                args.action_plan_cache
+                if args.navigation_input_mode == 'action_plan'
+                else None
+            ),
         )
         val_env = dataset_class(
             feat_db, val_instr_data, args.connectivity_dir, args.navigable_dir,
@@ -99,6 +106,12 @@ def main():
     load_dotenv(os.path.join(project_root,".env"),override=False)
 
     args = parse_args()
+
+    if args.navigation_input_mode == 'action_plan' and not args.action_plan_cache:
+        raise ValueError(
+            "--navigation_input_mode action_plan requires "
+            "--action_plan_cache /path/to/merged.jsonl"
+        )
 
     val_envs = build_dataset(args)
 

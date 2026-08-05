@@ -2,6 +2,8 @@ import os
 import json
 import numpy as np
 
+from action_plan_cache import attach_action_plans
+
 def load_instr_datasets(anno_dir, dataset, splits):
     data = []
     for split in splits:
@@ -13,10 +15,13 @@ def load_instr_datasets(anno_dir, dataset, splits):
 
     return data
 
-def construct_instrs(anno_dir, dataset, splits):
+def construct_instrs(anno_dir, dataset, splits, action_plan_cache=None):
     data = []
     if "instr" in splits[0]:
-        return load_instr_datasets(anno_dir, dataset, splits)
+        data = load_instr_datasets(anno_dir, dataset, splits)
+        if action_plan_cache:
+            data = attach_action_plans(data, action_plan_cache)
+        return data
 
     for i, item in enumerate(load_instr_datasets(anno_dir, dataset, splits)):
         # Split multiple instructions into separate entries 
@@ -27,4 +32,6 @@ def construct_instrs(anno_dir, dataset, splits):
             del new_item['instructions']
             del new_item['instr_encodings']
             data.append(new_item)
+    if action_plan_cache:
+        data = attach_action_plans(data, action_plan_cache)
     return data

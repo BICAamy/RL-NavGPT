@@ -33,6 +33,16 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument('--local_dtype', type=str, default='bf16', choices=['bf16', 'fp16'], help='dtype for local models')
+    parser.add_argument(
+        '--hf_device_map',
+        type=str,
+        default='single',
+        choices=['single', 'auto'],
+        help=(
+            'HF placement policy. single (default) keeps the full model on '
+            'one visible GPU; auto may split layers across devices.'
+        ),
+    )
     parser.add_argument('--top_p', type=float, default=0.9, help='top_p for local models')
     parser.add_argument('--max_new_tokens', type=int, default=512, help='max new tokens for local models')
     parser.add_argument('--gguf_n_ctx', type=int, default=4096, help='context length for gguf models')
@@ -72,7 +82,7 @@ def parse_args(argv=None):
         help=(
             'planner (default): generate an action plan with the selected LLM; '
             'instruction: use the raw R2R instruction; action_plan: read an '
-            'action_plan field from annotations'
+            'action plan from --action_plan_cache'
         ),
     )
     input_mode.add_argument(
@@ -90,6 +100,15 @@ def parse_args(argv=None):
         help='deprecated alias for --navigation_input_mode action_plan',
     )
     parser.set_defaults(navigation_input_mode='planner')
+    parser.add_argument(
+        '--action_plan_cache',
+        type=str,
+        default='',
+        help=(
+            'merged Planner JSONL cache required by '
+            '--navigation_input_mode action_plan'
+        ),
+    )
 
     parser.add_argument(
         '--use_relative_angle',
