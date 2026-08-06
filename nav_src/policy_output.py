@@ -123,6 +123,15 @@ def format_move_output(thought: str, viewpoint_id: str) -> str:
     )
 
 
+def format_backtrack_output(thought: str, viewpoint_id: str) -> str:
+    """Format a canonical return-to-visited-viewpoint action."""
+
+    return (
+        f"<Think>{thought.strip()}</Think>\n"
+        f'<Action>{BACK_TRACE_NAME}("{viewpoint_id}")</Action>'
+    )
+
+
 def format_finish_output(thought: str) -> str:
     """Format a canonical stop action."""
 

@@ -5,11 +5,7 @@ from typing import Any, List, Mapping, Optional
 from langchain.callbacks.manager import CallbackManagerForLLMRun
 from langchain.llms.base import LLM
 
-
-DEFAULT_SYSTEM_PROMPT = (
-    "You are a helpful assistant for embodied navigation. Follow the format "
-    "requested in the user prompt exactly."
-)
+from prompt.chat_prompt import DEFAULT_SYSTEM_PROMPT, build_chat_messages
 
 
 def render_hf_prompt(
@@ -29,10 +25,8 @@ def render_hf_prompt(
             "use --local_chat_template plain only if the model expects raw prompts."
         )
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": prompt},
-    ]
+    messages = build_chat_messages(prompt)
+    messages[0]["content"] = system_prompt
     return tokenizer.apply_chat_template(
         messages,
         tokenize=False,

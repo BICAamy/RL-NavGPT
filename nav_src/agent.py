@@ -34,6 +34,13 @@ from prompt.planner_prompt import (
     get_prompt_set,
 )
 from planner import build_planner_chain, generate_action_plan
+from navigation_state import (
+    NavigationPromptConfig,
+    NavigationStateBuilder,
+    PromptTraceStep,
+    build_policy_scratchpad,
+    describe_turn,
+)
 
 MAX_SCRATCHPAD_LENGTH = 7000
 
@@ -90,16 +97,26 @@ class VLNAgent(ZeroShotAgent):
         self, intermediate_steps: List[Tuple[AgentAction, str]]
     ) -> Union[str, List[BaseMessage]]:
         """Construct the scratchpad that lets the agent continue its thought process."""
-        thoughts = ""
-        nav_step = 1
-        for i, (action, observation) in enumerate(intermediate_steps):
-            thoughts += action.log
-            if (i == len(intermediate_steps) - 1) or (action.tool != MAKE_ACTION_TOOL_NAME):
-                thoughts += f"\n{self.observation_prefix}{observation}\n{self.llm_prefix}"
-            else:
-                thoughts += f"\n{self.observation_prefix}{self.history[nav_step]}\n{self.llm_prefix}"
-                nav_step += 1
-        return thoughts
+        history = self.history or []
+        move_index = 1
+        trace = []
+        for action, observation in intermediate_steps:
+            history_text = (
+                history[move_index]
+                if move_index < len(history)
+                else observation
+            )
+            trace.append(
+                PromptTraceStep(
+                    model_output=action.log,
+                    action_name=action.tool,
+                    history=history_text,
+                    observation=observation,
+                )
+            )
+            if action.tool == MAKE_ACTION_TOOL_NAME:
+                move_index += 1
+        return build_policy_scratchpad(trace, self.max_scratchpad_length)
 
     def get_full_inputs(
         self, intermediate_steps: List[Tuple[AgentAction, str]], **kwargs: Any
@@ -130,6 +147,9 @@ class NavAgent(BaseAgent):
         """
         super().__init__(env)
         self.config = config
+        self.state_builder = NavigationStateBuilder(
+            NavigationPromptConfig.from_namespace(config)
+        )
 
         if config.llm_backend == 'openai':
             self.prompt_set = get_prompt_set('plain')
@@ -252,104 +272,23 @@ class NavAgent(BaseAgent):
     
     def get_history(self, obs: dict, angle: str) -> str:
         '''Return the history of actions taken.'''
-        history = f'{angle}\nCurrent viewpoint "{obs["viewpoint"]}": Scene from the viewpoint is a {obs["obs_summary"]}'
-        return history
+        return self.state_builder.history_after_move(obs, angle)
 
     def get_navigable_str(self, cur_heading: float, cur_elevation: float, navigable: dict) -> str:
         '''Return the navigable viewpoints as a string.'''
-        navigable_str = ''
-
-        for vp, items in navigable.items():
-            heading = np.rad2deg(items['heading'])
-            elevation = np.rad2deg(items['elevation'])
-            distance = items['distance']
-            rel_heading = heading - cur_heading
-            rel_elevation = elevation - cur_elevation
-
-            if self.config.use_relative_angle:
-                navigable_str += f"'{vp}':\nheading: {rel_heading:.2f}, elevation: {rel_elevation:.2f}, distance: {distance:.2f}\n"
-            else:
-                navigable_str += f"'{vp}':\nheading: {heading:.2f}, elevation: {elevation:.2f}, distance: {distance:.2f}\n"
-
-        return navigable_str
+        return self.state_builder.get_navigable_str(
+            cur_heading,
+            cur_elevation,
+            navigable,
+        )
 
     def modify_heading_angles(self, heading_angle, observation_list, candidate_dict, object_list):
-        # Function to normalize an angle to the range of -180 to 180
-        def normalize_angle(angle):
-            while angle > 180:
-                angle -= 360
-            while angle <= -180:
-                angle += 360
-            return angle
-        
-        def angle_to_left_right(angle):
-            return f"left {-angle:.2f}" if angle < 0 else f"right {angle:.2f}"
-        
-        # Define the directions
-        directions = ['Front', 'Front Right', 'Right', 'Rear Right', 'Rear', 'Rear Left', 'Left', 'Front Left']
-
-        # Calculate the range of heading angles belonging to each direction
-        range_idx = int((heading_angle - 22.5) // 45) + 1
-        obs_idx = [(i + range_idx) % 8 for i in range(8)]
-        
-        # Initialize a dictionary to store the candidate viewpoints for each direction
-        candidate_range = {}
-        if not self.config.use_navigable:
-            for viewpoint_id, viewpoint_data in candidate_dict.items():
-                viewpoint_heading = np.rad2deg(viewpoint_data['heading'])
-                vp_range_idx = int((viewpoint_heading - 22.5) // 45) + 1
-                rel_viewpoint_heading = viewpoint_heading - heading_angle
-                rel_viewpoint_heading = normalize_angle(rel_viewpoint_heading)
-                rel_viewpoint_heading = angle_to_left_right(rel_viewpoint_heading)
-                vp_description = rel_viewpoint_heading + f', {viewpoint_data["distance"]:.2f}m'
-                # rel_range_idx = (vp_range_idx - range_idx) % 8
-                candidate_range.setdefault(vp_range_idx, {}).update({viewpoint_id: vp_description})
-
-        # Calculate the relative angle ranges based on the heading angle
-        angle_ranges = [(angle - 22.5 - heading_angle, angle + 22.5 - heading_angle) for angle in range(0, 360, 45)]
-        
-        # Initialize an empty list to store the formatted strings
-        formatted_strings = []
-        
-        # Iterate through the directions, angle ranges, and observation strings
-        for direction, idx in zip(directions, obs_idx):
-            # Calculate the relative angles and normalize them
-            rel_angle1 = normalize_angle(angle_ranges[idx][0])
-            rel_angle2 = normalize_angle(angle_ranges[idx][1])
-
-            # Convert the angles to "left n" or "right n"
-            left_right1 = angle_to_left_right(rel_angle1)
-            left_right2 = angle_to_left_right(rel_angle2)
-            
-            # Create the formatted string
-            formatted_string = f"{direction}, range ({left_right1} to {left_right2}): \n'{observation_list[idx]}'"
-
-            # Add the objects to the formatted string
-            object_dict = {}
-            if len(object_list[idx]) > 0:
-                object = object_list[idx]
-                for obj, obj_data in object.items():
-                    rel_obj_heading = obj_data['heading'] - heading_angle
-                    rel_obj_heading = normalize_angle(rel_obj_heading)
-                    rel_obj_heading = angle_to_left_right(rel_obj_heading)
-                    object_dict[obj] = f'{rel_obj_heading}, {obj_data["distance"]:.2f}m'
-                formatted_string += f'\n{direction} Objects in 3m: {object_dict}'
-            else:
-                formatted_string += f'\n{direction} Objects in 3m: None'
-
-            # Add the candidate viewpoints to the formatted string
-            if candidate_range.get(idx):
-                formatted_string += f'\n{direction} Navigable Viewpoints:{candidate_range[idx]}'
-            else:
-                formatted_string += f'\n{direction} Navigable Viewpoints: None'
-   
-            # Add the formatted string to the list
-            formatted_strings.append(formatted_string)
-        
-        # Join the formatted strings into a single output string
-        output_string = '\n'.join(formatted_strings)
-        
-        return output_string
+        return self.state_builder.modify_heading_angles(
+            heading_angle,
+            observation_list,
+            candidate_dict,
+            object_list,
+        )
 
     def init_trajecotry(self, obs: List[dict]):
         """Initialize the trajectory with the given observation."""
@@ -360,7 +299,9 @@ class NavAgent(BaseAgent):
             'details': [],
         } for ob in obs]
         # Record the history of actions taken
-        self.agent_executor.agent.history = [f'Navigation start, no actions taken yet.\nCurrent viewpoint "{obs[0]["viewpoint"]}": Scene from the viewpoint is a {obs[0]["obs_summary"]}']
+        self.agent_executor.agent.history = [
+            self.state_builder.initial_history(obs[0])
+        ]
 
     def _create_make_action_tool(
             self,
@@ -653,16 +594,6 @@ class NavAgent(BaseAgent):
         Take in the next viewpoint ID and move the agent to that viewpoint
         return the turned angle and new observation
         """
-        def normalize_angle(angle):
-            while angle > 180:
-                angle -= 360
-            while angle <= -180:
-                angle += 360
-            return angle
-
-        def angle_to_left_right(angle):
-            return f"left {-angle:.2f}" if angle < 0 else f"right {angle:.2f}"
-        
         # Get current agent facing angle
         cur_obs = self.env._get_obs()[0]
         cur_heading = np.rad2deg(cur_obs['heading'])
@@ -672,11 +603,7 @@ class NavAgent(BaseAgent):
         # Record the trajectory
         self.traj[0]['path'].append(self.env.env.sims[0].gmap.bfs_shortest_path(cur_obs['viewpoint'], actions[0])[1:])
         # Calculate the turned angle
-        turned_angle = new_heading - cur_heading
-        # Generate action description
-        cur_heading = angle_to_left_right(normalize_angle(cur_heading))
-        new_heading = angle_to_left_right(normalize_angle(new_heading))
-        action_description = f'Turn heading direction {turned_angle:.2f} degrees from {cur_heading} to {new_heading}.'
+        action_description = describe_turn(cur_heading, new_heading)
         return action_description, new_obs
 
     def rollout(self, reset=True):
@@ -717,32 +644,11 @@ class NavAgent(BaseAgent):
                     'observation': first_obs,
                 }
             else:
-                # Get current feature
-                feature = init_ob['obs']
-                navigable = init_ob['candidate']
-                objects = init_ob['objects']
-                heading = np.rad2deg(init_ob['heading'])
-                elevation = np.rad2deg(init_ob['elevation'])
-                orientation = f'\nheading: {heading:.2f}, elevation: {elevation:.2f}'
-                if self.config.use_relative_angle:
-                    feature = self.modify_heading_angles(heading, feature, navigable, objects)
-                if self.config.use_navigable:
-                    navigable = self.get_navigable_str(heading, elevation, navigable)
-
-                if self.config.use_relative_angle:
-                    if self.config.use_navigable:
-                        init_observation = f"\n\tCurrent Viewpoint:\n{feature}\n\tNavigable Viewpoints:\n{navigable}"
-                    else:
-                        init_observation = f"\n\tCurrent Viewpoint:\n{feature}"
-                else:
-                    if self.config.use_navigable:
-                        init_observation = f"\n\tCurrent Orientation:\n{orientation}\n\tCurrent Viewpoint:\n{feature}\n\tNavigable Viewpoints:\n{navigable}"
-                    else:
-                        init_observation = f"\n\tCurrent Orientation:\n{orientation}\n\tCurrent Viewpoint:\n{feature}"
-
                 input = {
                     'action_plan': self.cur_action_plan,
-                    'init_observation': init_observation,
+                    'init_observation': (
+                        self.state_builder.format_initial_observation(init_ob)
+                    ),
                 }
             output = self.agent_executor(input)
 

@@ -39,6 +39,7 @@ from action_plan_cache import (  # noqa: E402
     write_jsonl_atomic,
 )
 from prompt.planner_prompt import PLANNER_PROMPT  # noqa: E402
+from prompt.chat_prompt import DEFAULT_SYSTEM_PROMPT  # noqa: E402
 
 
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-14B-Instruct-1M"
@@ -109,7 +110,6 @@ def require_expected_count(
 def build_planner_definition(args: argparse.Namespace) -> Dict[str, Any]:
     import torch
     import transformers
-    from LLMs.hf_chat import DEFAULT_SYSTEM_PROMPT
 
     installed_version = transformers.__version__
     if installed_version != args.expected_transformers_version:

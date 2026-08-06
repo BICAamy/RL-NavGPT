@@ -13,6 +13,33 @@ from utils.graph_utils import NavGraph
 
 ERROR_MARGIN = 3.0
 
+
+class NavigationGraphCache(object):
+    """Read-only navigation graphs and all-pairs shortest paths.
+
+    A GRPO batch can own many independent simulators, but their Matterport3D
+    connectivity is immutable.  Sharing this cache avoids recomputing all-pairs
+    paths once per rollout.
+    """
+
+    def __init__(self, connectivity_dir, scans):
+        self.connectivity_dir = connectivity_dir
+        self.scans = frozenset(scans)
+        if not self.scans:
+            raise ValueError('NavigationGraphCache requires at least one scan')
+        print('Loading navigation graphs for %d scans' % len(self.scans))
+        self.graphs = load_nav_graphs(self.connectivity_dir, self.scans)
+        for graph in self.graphs.values():
+            nx.freeze(graph)
+        self.shortest_paths = {
+            scan: dict(nx.all_pairs_dijkstra_path(graph))
+            for scan, graph in self.graphs.items()
+        }
+        self.shortest_distances = {
+            scan: dict(nx.all_pairs_dijkstra_path_length(graph))
+            for scan, graph in self.graphs.items()
+        }
+
 class Simulator(object):
     ''' A simple simulator in Matterport3D environment '''
 
@@ -38,6 +65,7 @@ class Simulator(object):
         self.elevation = elevation
         self.scan_ID = scan_ID
         self.viewpoint_ID = viewpoint_ID
+        self.gmap = NavGraph()
         # Load navigable dict
         navigable_path = os.path.join(self.navigable_dir, self.scan_ID + '_navigable.json')
         with open(navigable_path, 'r') as f:
@@ -67,7 +95,7 @@ class Simulator(object):
         self.candidate = self.navigable_dict[self.viewpoint_ID]
         self.updateGraph()
     
-    def makeAction(self, next_viewpoint_ID):
+    def makeAction(self, next_viewpoint_ID, strict=False):
         """
         Make action and update the agent's state.
         """
@@ -76,6 +104,11 @@ class Simulator(object):
         elif next_viewpoint_ID in self.candidate.keys():
             self.heading = self.candidate[next_viewpoint_ID]['heading']
             self.elevation = self.candidate[next_viewpoint_ID]['elevation']
+        elif strict:
+            raise ValueError(
+                f'Viewpoint "{next_viewpoint_ID}" is not adjacent to '
+                f'"{self.viewpoint_ID}"'
+            )
         self.viewpoint_ID = next_viewpoint_ID
         self.getCandidate()
 
@@ -120,10 +153,10 @@ class EnvBatch(object):
             feature_states.append((feature, state))
         return feature_states
 
-    def makeActions(self, next_viewpoint_IDs):
+    def makeActions(self, next_viewpoint_IDs, strict=False):
         ''' Take an action using the full state dependent action interface (with batched input)'''
         for i, next_viewpoint_ID in enumerate(next_viewpoint_IDs):
-            self.sims[i].makeAction(next_viewpoint_ID)
+            self.sims[i].makeAction(next_viewpoint_ID, strict=strict)
 
 
 class R2RNavBatch(object):
@@ -131,28 +164,43 @@ class R2RNavBatch(object):
 
     def __init__(
         self, view_db, instr_data, connectivity_dir, navigable_dir,
-        batch_size=1, seed=0, name=None,
+        batch_size=1, seed=0, name=None, graph_cache=None, verbose=True,
     ):
         self.env = EnvBatch(navigable_dir, feat_db=view_db, batch_size=batch_size)
-        self.data = instr_data
+        # Keep the caller-owned annotation list untouched.  This matters for
+        # RL rollout groups, where several isolated environments are created
+        # from the same task collection.
+        self.data = list(instr_data)
         self.scans = set([x['scan'] for x in self.data])
         self.connectivity_dir = connectivity_dir
         self.batch_size = batch_size
         self.name = name
+        self.graph_cache = graph_cache
+        self.verbose = verbose
 
         self.gt_trajs = self._get_gt_trajs(self.data) # for evaluation
 
-        # use different seeds in different processes to shuffle data
+        # Use an instance-local RNG.  Re-seeding Python's process-wide random
+        # module here would perturb GRPO sampling every time a rollout
+        # environment is constructed.
         self.seed = seed
-        random.seed(self.seed)
-        random.shuffle(self.data)
+        self._rng = random.Random(self.seed)
+        self._rng.shuffle(self.data)
+
+        self.instr_id_to_item = {}
+        for item in self.data:
+            instr_id = str(item['instr_id'])
+            if instr_id in self.instr_id_to_item:
+                raise ValueError(f'Duplicate instr_id in environment: {instr_id}')
+            self.instr_id_to_item[instr_id] = item
 
         self.ix = 0
         self._load_nav_graphs()
         
         self.buffered_state_dict = {}
-        print('%s loaded with %d instructions, using splits: %s' % (
-            self.__class__.__name__, len(self.data), self.name))
+        if self.verbose:
+            print('%s loaded with %d instructions, using splits: %s' % (
+                self.__class__.__name__, len(self.data), self.name))
 
     def _get_gt_trajs(self, data):
         gt_trajs = {
@@ -173,14 +221,27 @@ class R2RNavBatch(object):
         Load connectivity graph for each scan, useful for reasoning about shortest paths
         :return: None
         """
-        print('Loading navigation graphs for %d scans' % len(self.scans))
-        self.graphs = load_nav_graphs(self.connectivity_dir, self.scans)
-        self.shortest_paths = {}
-        for scan, G in self.graphs.items():  # compute all shortest paths
-            self.shortest_paths[scan] = dict(nx.all_pairs_dijkstra_path(G))
-        self.shortest_distances = {}
-        for scan, G in self.graphs.items():  # compute all shortest paths
-            self.shortest_distances[scan] = dict(nx.all_pairs_dijkstra_path_length(G))
+        if self.graph_cache is None:
+            self.graph_cache = NavigationGraphCache(
+                self.connectivity_dir,
+                self.scans,
+            )
+        missing_scans = self.scans.difference(self.graph_cache.scans)
+        if missing_scans:
+            raise ValueError(
+                'Navigation graph cache is missing scans: %s'
+                % sorted(missing_scans)[:5]
+            )
+        self.graphs = {
+            scan: self.graph_cache.graphs[scan] for scan in self.scans
+        }
+        self.shortest_paths = {
+            scan: self.graph_cache.shortest_paths[scan] for scan in self.scans
+        }
+        self.shortest_distances = {
+            scan: self.graph_cache.shortest_distances[scan]
+            for scan in self.scans
+        }
 
     def _next_minibatch(self, batch_size=None, **kwargs):
         """
@@ -191,7 +252,7 @@ class R2RNavBatch(object):
         
         batch = self.data[self.ix: self.ix+batch_size]
         if len(batch) < batch_size:
-            random.shuffle(self.data)
+            self._rng.shuffle(self.data)
             self.ix = batch_size - len(batch)
             batch += self.data[:self.ix]
         else:
@@ -202,7 +263,7 @@ class R2RNavBatch(object):
         ''' Reset the data index to beginning of epoch. Primarily for testing.
             You must still call reset() for a new episode. '''
         if shuffle:
-            random.shuffle(self.data)
+            self._rng.shuffle(self.data)
         self.ix = 0
 
     def _get_obs(self):
@@ -247,9 +308,34 @@ class R2RNavBatch(object):
         self.env.newEpisodes(scanIds, viewpointIds, headings)
         return self._get_obs()
 
-    def step(self, next_viewpoint_IDs):
+    def reset_to_instr_ids(self, instr_ids):
+        """Reset to exact tasks without advancing or shuffling the data cursor."""
+
+        if isinstance(instr_ids, str):
+            instr_ids = [instr_ids]
+        instr_ids = [str(instr_id) for instr_id in instr_ids]
+        if len(instr_ids) != self.batch_size:
+            raise ValueError(
+                f'Expected {self.batch_size} instr_id values, got {len(instr_ids)}'
+            )
+        missing = [
+            instr_id
+            for instr_id in instr_ids
+            if instr_id not in self.instr_id_to_item
+        ]
+        if missing:
+            raise KeyError(f'Unknown instr_id values: {missing[:5]}')
+
+        self.batch = [self.instr_id_to_item[instr_id] for instr_id in instr_ids]
+        scan_ids = [item['scan'] for item in self.batch]
+        viewpoint_ids = [item['path'][0] for item in self.batch]
+        headings = [item['heading'] for item in self.batch]
+        self.env.newEpisodes(scan_ids, viewpoint_ids, headings)
+        return self._get_obs()
+
+    def step(self, next_viewpoint_IDs, strict=False):
         ''' Take action (same interface as makeActions) '''
-        self.env.makeActions(next_viewpoint_IDs)
+        self.env.makeActions(next_viewpoint_IDs, strict=strict)
         return self._get_obs()
 
     ############### Nav Evaluation ###############
