@@ -29,6 +29,7 @@ from rl_env import (  # noqa: E402
     NavGPTEnvironmentFactory,
     NavGPTGymEnv,
     NavGPTTRLEnvironment,
+    trl_environment_reward,
 )
 from utils.data import ImageObservationsDB  # noqa: E402
 
@@ -370,12 +371,21 @@ def main() -> None:
     }
     require(
         public_methods
-        == {"get_reward", "reset", "submit_navigation_decision"},
+        == {"reset", "submit_navigation_decision"},
         f"Unexpected TRL-exposed methods: {sorted(public_methods)}",
     )
+    trl_tool_methods = public_methods.difference({"reset"})
+    require(
+        trl_tool_methods == {"submit_navigation_decision"},
+        f"TRL would expose unexpected tools: {sorted(trl_tool_methods)}",
+    )
     trl_prompt = trl_environment.reset(instr_id=instr_id)
-    require(trl_prompt == prompt_a, "TRL reset changed the policy prompt")
-    trl_environment.submit_navigation_decision(
+    require(prompt_a in trl_prompt, "TRL reset dropped the policy prompt")
+    require(
+        "Call `submit_navigation_decision` exactly once" in trl_prompt,
+        "TRL reset omitted the native tool protocol",
+    )
+    tool_observation = trl_environment.submit_navigation_decision(
         format_move_output("Validate the TRL adapter.", invalid_target)
     )
     require(
@@ -383,8 +393,12 @@ def main() -> None:
         "TRL adapter bypassed canonical action validation",
     )
     require(
-        trl_environment.get_reward() == 0.0,
-        "TRL adapter returned the wrong stage-three reward",
+        "not an adjacent candidate" in tool_observation,
+        "TRL tool did not return the resulting environment observation",
+    )
+    require(
+        trl_environment_reward([trl_environment]) == [0.0],
+        "TRL reward function returned the wrong stage-three reward",
     )
 
     print(f"PASS instr_id={instr_id}")
@@ -397,7 +411,7 @@ def main() -> None:
     print("- Gymnasium API checked by gymnasium.utils.env_checker")
     print("- isolated rollout simulators, reward state, and shared graph cache")
     print("- identical group state without perturbing Python's global RNG")
-    print("- zero-argument TRL lifecycle adapter with one policy tool")
+    print("- TRL-native adapter with one tool and explicit reward function")
 
 
 if __name__ == "__main__":

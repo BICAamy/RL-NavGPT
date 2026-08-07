@@ -15,6 +15,7 @@ from typing import (
     Protocol,
     Sequence,
     Tuple,
+    Union,
 )
 
 import gymnasium as gym
@@ -53,6 +54,7 @@ class NavigationTransition:
     current_observation: Mapping[str, Any]
     previous_visual_feature: Any
     current_visual_feature: Any
+    history: Tuple[str, ...]
     previous_distance: float
     current_distance: float
     action_valid: bool
@@ -68,13 +70,21 @@ class NavigationTransition:
     termination_reason: Optional[str]
 
 
+@dataclass(frozen=True)
+class RewardResult:
+    """Reward-bearing components plus non-reward diagnostic measurements."""
+
+    components: Mapping[str, float]
+    diagnostics: Mapping[str, Any]
+
+
 class RewardCalculator(Protocol):
     """Interface implemented by the composite reward in stage four."""
 
     def __call__(
         self,
         transition: NavigationTransition,
-    ) -> Mapping[str, float]:
+    ) -> Union[Mapping[str, float], RewardResult]:
         ...
 
 
@@ -126,6 +136,13 @@ class NavGPTEnvironmentFactory:
         self.success_distance = success_distance
         self.reward_calculator_factory = reward_calculator_factory
         self.visual_feature_provider = visual_feature_provider
+        validate_visual_provider = getattr(
+            self.reward_calculator_factory,
+            "validate_visual_feature_provider",
+            None,
+        )
+        if callable(validate_visual_provider):
+            validate_visual_provider(self.visual_feature_provider)
         self.instr_id_to_item: Dict[str, Dict[str, Any]] = {}
         for source in instr_data:
             item = dict(source)
@@ -242,11 +259,11 @@ class NavGPTTRLEnvironmentFactory:
 class NavGPTTRLEnvironment:
     """TRL lifecycle adapter around the canonical text-action Gym environment.
 
-    TRL reserves ``reset`` and ``get_reward`` and exposes the remaining public
-    methods as model tools.  Composition is intentional: inheriting ``gym.Env``
-    here would accidentally expose helpers such as ``render`` and ``close`` as
-    tools.  The policy decision is still parsed by :func:`parse_policy_output`;
-    this adapter never introduces a second action protocol.
+    TRL reserves only ``reset`` and exposes every other public bound method as
+    a model tool.  Composition is intentional: inheriting ``gym.Env`` here
+    would accidentally expose helpers such as ``render`` and ``close`` as
+    tools.  The sole tool accepts the canonical policy text, which is still
+    parsed by :func:`parse_policy_output`.
     """
 
     def __init__(self, gym_factory: NavGPTEnvironmentFactory):
@@ -280,7 +297,7 @@ class NavGPTTRLEnvironment:
                 of one GRPO group.
 
         Returns:
-            The same backend-neutral policy prompt used by zero-shot inference.
+            The backend-neutral policy prompt plus the TRL-native tool rule.
         """
 
         self._environment = self._gym_factory.create(str(instr_id))
@@ -288,14 +305,44 @@ class NavGPTTRLEnvironment:
             options={"instr_id": str(instr_id)}
         )
         self._last_info = info
-        return prompt
+        return (
+            "\n\n"
+            + prompt
+            + "\n\nTRL tool protocol (this changes only the transport of the "
+            "decision, not its inner format): do not print the decision as "
+            "ordinary assistant text. Call `submit_navigation_decision` "
+            "exactly once per navigation step. Its `policy_output` argument "
+            "must contain exactly the canonical <Think>...</Think> followed "
+            "by <Action>...</Action> text specified above. After each tool "
+            "result, either call the same tool again or submit a canonical "
+            "finish action through it."
+        )
 
-    def get_reward(self) -> float:
-        """Return the accumulated state-dependent reward for this rollout."""
+    def _get_accumulated_reward(self) -> float:
+        """Private reward accessor; private methods are not TRL tools."""
 
         if self._environment is None:
-            raise RuntimeError("reset() must be called before get_reward()")
-        return self._environment.get_reward()
+            raise RuntimeError(
+                "reset() must be called before reading environment reward"
+            )
+        episode_return = self._environment.get_reward()
+        episode_ended = bool(
+            self._last_info
+            and (
+                self._last_info["terminated"]
+                or self._last_info["truncated"]
+            )
+        )
+        if episode_ended:
+            return episode_return
+        finalize = getattr(
+            self._environment.reward_calculator,
+            "finalize_incomplete_return",
+            None,
+        )
+        if callable(finalize):
+            return float(finalize(episode_return))
+        return episode_return
 
     def submit_navigation_decision(self, policy_output: str) -> str:
         """Execute one complete canonical navigation policy decision.
@@ -305,8 +352,9 @@ class NavGPTTRLEnvironment:
                 ``<Action>...</Action>`` block.
 
         Returns:
-            The next policy prompt, including the resulting observation and
-            terminal status when the episode has ended.
+            The compact resulting observation.  Conversation history already
+            contains earlier decisions, so repeating the full prompt would
+            grow the native tool transcript quadratically.
         """
 
         if self._environment is None:
@@ -321,9 +369,38 @@ class NavGPTTRLEnvironment:
                 f'{self._last_info["termination_reason"]}; do not issue '
                 "another navigation decision."
             )
-        prompt, _, _, _, info = self._environment.step(policy_output)
+        _, _, _, _, info = self._environment.step(policy_output)
         self._last_info = info
-        return prompt
+        step_record = self._environment.trajectory[-1]
+        observation = str(step_record["environment_observation"])
+        if info["terminated"] or info["truncated"]:
+            return observation
+        return (
+            observation
+            + "\nCall `submit_navigation_decision` with the next canonical "
+            "<Think>/<Action> decision."
+        )
+
+
+def trl_environment_reward(
+    environments: Sequence[NavGPTTRLEnvironment],
+    **_: Any,
+) -> List[float]:
+    """TRL reward function returning each stateful environment's episode sum.
+
+    Pass this function in ``GRPOTrainer(..., reward_funcs=[...])`` whenever
+    ``environment_factory`` creates :class:`NavGPTTRLEnvironment` instances.
+    """
+
+    rewards: List[float] = []
+    for index, environment in enumerate(environments):
+        if not isinstance(environment, NavGPTTRLEnvironment):
+            raise TypeError(
+                "trl_environment_reward expected NavGPTTRLEnvironment at "
+                f"index {index}, got {type(environment).__name__}"
+            )
+        rewards.append(float(environment._get_accumulated_reward()))
+    return rewards
 
 
 class NavGPTGymEnv(gym.Env):
@@ -374,6 +451,13 @@ class NavGPTGymEnv(gym.Env):
         self.success_distance = success_distance
         self.reward_calculator = reward_calculator or ZeroRewardCalculator()
         self.visual_feature_provider = visual_feature_provider
+        validate_visual_provider = getattr(
+            self.reward_calculator,
+            "validate_visual_feature_provider",
+            None,
+        )
+        if callable(validate_visual_provider):
+            validate_visual_provider(self.visual_feature_provider)
         self.render_mode = render_mode
 
         text_charset = string.printable
@@ -448,6 +532,9 @@ class NavGPTGymEnv(gym.Env):
 
         self._observation = observation
         self._visual_feature_cache = {}
+        reset_reward = getattr(self.reward_calculator, "reset", None)
+        if callable(reset_reward):
+            reset_reward(initial_observation=dict(observation))
         self._initial_observation_text = (
             self.state_builder.format_initial_observation(observation)
         )
@@ -489,6 +576,7 @@ class NavGPTGymEnv(gym.Env):
 
         previous_prompt = self._policy_prompt
         previous_observation = dict(self._observation)
+        previous_history = tuple(self._history)
         previous_visual_feature = self._visual_feature_for(
             previous_observation
         )
@@ -611,6 +699,7 @@ class NavGPTGymEnv(gym.Env):
             current_observation=dict(self._observation),
             previous_visual_feature=previous_visual_feature,
             current_visual_feature=current_visual_feature,
+            history=previous_history,
             previous_distance=previous_distance,
             current_distance=current_distance,
             action_valid=action_valid,
@@ -625,7 +714,9 @@ class NavGPTGymEnv(gym.Env):
             reached_goal_region=reached_goal_region,
             termination_reason=self._termination_reason,
         )
-        reward_components = self._calculate_reward(transition)
+        reward_components, reward_diagnostics = self._calculate_reward(
+            transition
+        )
         reward = float(sum(reward_components.values()))
         self._episode_return += reward
 
@@ -657,11 +748,13 @@ class NavGPTGymEnv(gym.Env):
             "revisited": revisited,
             "reward": reward,
             "reward_components": dict(reward_components),
+            "reward_diagnostics": dict(reward_diagnostics),
             "terminated": self._terminated,
             "truncated": self._truncated,
             "success": self._success,
             "termination_reason": self._termination_reason,
             "environment_error": environment_error,
+            "environment_observation": environment_text,
         }
         self._trajectory.append(step_record)
         info = self._build_info(
@@ -671,6 +764,7 @@ class NavGPTGymEnv(gym.Env):
             moved_path=moved_path,
             revisited=revisited,
             reward_components=reward_components,
+            reward_diagnostics=reward_diagnostics,
             environment_error=environment_error,
         )
         return (
@@ -727,8 +821,14 @@ class NavGPTGymEnv(gym.Env):
     def _calculate_reward(
         self,
         transition: NavigationTransition,
-    ) -> Dict[str, float]:
-        raw_components = self.reward_calculator(transition)
+    ) -> Tuple[Dict[str, float], Dict[str, Any]]:
+        raw_result = self.reward_calculator(transition)
+        if isinstance(raw_result, RewardResult):
+            raw_components = raw_result.components
+            raw_diagnostics = raw_result.diagnostics
+        else:
+            raw_components = raw_result
+            raw_diagnostics = {}
         if not isinstance(raw_components, Mapping):
             raise TypeError("reward_calculator must return a mapping")
         components: Dict[str, float] = {}
@@ -737,7 +837,33 @@ class NavGPTGymEnv(gym.Env):
             if not math.isfinite(numeric_value):
                 raise ValueError(f'Reward component "{name}" is not finite')
             components[str(name)] = numeric_value
-        return components
+        if not isinstance(raw_diagnostics, Mapping):
+            raise TypeError("reward diagnostics must be a mapping")
+        diagnostics = {
+            str(name): self._normalize_diagnostic(value)
+            for name, value in raw_diagnostics.items()
+        }
+        return components, diagnostics
+
+    @classmethod
+    def _normalize_diagnostic(cls, value: Any) -> Any:
+        if isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("Reward diagnostics must be finite or None")
+        if isinstance(value, Mapping):
+            return {
+                str(key): cls._normalize_diagnostic(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [cls._normalize_diagnostic(item) for item in value]
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        raise TypeError(
+            "Reward diagnostics must contain JSON-compatible values, got "
+            f"{type(value).__name__}"
+        )
 
     def _in_goal_region(self, distance: float) -> bool:
         return distance < self.success_distance
@@ -794,6 +920,7 @@ class NavGPTGymEnv(gym.Env):
         moved_path: Sequence[str] = (),
         revisited: bool = False,
         reward_components: Optional[Mapping[str, float]] = None,
+        reward_diagnostics: Optional[Mapping[str, Any]] = None,
         environment_error: Optional[str] = None,
     ) -> Dict[str, Any]:
         assert self._observation is not None
@@ -834,6 +961,7 @@ class NavGPTGymEnv(gym.Env):
             "moved_path": tuple(moved_path),
             "revisited": revisited,
             "reward_components": dict(reward_components or {}),
+            "reward_diagnostics": dict(reward_diagnostics or {}),
             "episode_return": self._episode_return,
             "terminated": self._terminated,
             "truncated": self._truncated,
