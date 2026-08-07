@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
@@ -27,6 +28,8 @@ DEFAULT_LORA_TARGET_MODULES: Tuple[str, ...] = (
     "up_proj",
     "down_proj",
 )
+ADAPTER_MANIFEST_NAME = "navgpt_adapter_manifest.json"
+ADAPTER_MANIFEST_SCHEMA_VERSION = 1
 
 
 class LoRAPolicyError(RuntimeError):
@@ -102,6 +105,7 @@ class TargetModuleReport:
     """Projection-layer audit performed before PEFT mutates the model."""
 
     num_hidden_layers: int
+    rank: int
     matches_by_target: Mapping[str, Tuple[str, ...]]
     weight_shapes: Mapping[str, Tuple[int, int]]
     expected_lora_parameters: int
@@ -113,6 +117,7 @@ class TargetModuleReport:
     def as_dict(self) -> Dict[str, Any]:
         return {
             "num_hidden_layers": self.num_hidden_layers,
+            "rank": self.rank,
             "target_module_counts": {
                 name: len(matches)
                 for name, matches in self.matches_by_target.items()
@@ -159,6 +164,7 @@ class LoRAPolicyBundle:
     config: LoRAPolicyConfig
     target_report: TargetModuleReport
     parameter_report: TrainableParameterReport
+    adapter_path: Optional[str] = None
 
     def summary(self) -> Dict[str, Any]:
         model_config = getattr(self.model, "config", None)
@@ -169,6 +175,10 @@ class LoRAPolicyBundle:
             "model_type": getattr(model_config, "model_type", None),
             "dtype": self.config.dtype,
             "device_map": self.config.device_map,
+            "adapter_source": (
+                "initialized" if self.adapter_path is None else "reloaded"
+            ),
+            "adapter_path": self.adapter_path,
             "lora": {
                 "r": self.config.r,
                 "lora_alpha": self.config.lora_alpha,
@@ -180,6 +190,38 @@ class LoRAPolicyBundle:
             "targets": self.target_report.as_dict(),
             "parameters": self.parameter_report.as_dict(),
         }
+
+
+@dataclass(frozen=True)
+class AdapterCheckpointReport:
+    """Verified files written by :func:`save_lora_adapter`."""
+
+    path: str
+    weights_file: str
+    weights_size_bytes: int
+    weights_sha256: str
+    config_sha256: str
+    manifest_file: str
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "path": self.path,
+            "weights_file": self.weights_file,
+            "weights_size_bytes": self.weights_size_bytes,
+            "weights_sha256": self.weights_sha256,
+            "config_sha256": self.config_sha256,
+            "manifest_file": self.manifest_file,
+        }
+
+
+@dataclass(frozen=True)
+class PolicyModelLoader:
+    """Stable stage-six entry point for new or resumed Policy models."""
+
+    config: LoRAPolicyConfig
+
+    def load(self, *, adapter_path: Optional[str] = None) -> LoRAPolicyBundle:
+        return load_policy_model(self.config, adapter_path=adapter_path)
 
 
 def validate_local_model_directory(model_path: str) -> Path:
@@ -367,15 +409,34 @@ def validate_target_modules(
             f"Requested LoRA target modules were not found: {missing}"
         )
 
-    wrong_counts = {
-        name: len(names)
-        for name, names in matches.items()
-        if len(names) != num_hidden_layers
-    }
-    if wrong_counts:
+    coverage_errors: Dict[str, Dict[str, Any]] = {}
+    expected_layer_indices = set(range(num_hidden_layers))
+    for target_name, module_names in matches.items():
+        layer_indices = [
+            _hidden_layer_index(module_name) for module_name in module_names
+        ]
+        actual_counts = Counter(layer_indices)
+        missing_layers = sorted(expected_layer_indices - set(actual_counts))
+        duplicate_layers = sorted(
+            layer_index
+            for layer_index, count in actual_counts.items()
+            if layer_index is not None and count != 1
+        )
+        invalid_modules = sorted(
+            module_name
+            for module_name, layer_index in zip(module_names, layer_indices)
+            if layer_index is None or layer_index not in expected_layer_indices
+        )
+        if missing_layers or duplicate_layers or invalid_modules:
+            coverage_errors[target_name] = {
+                "missing_layers": missing_layers,
+                "duplicate_layers": duplicate_layers,
+                "invalid_modules": invalid_modules,
+            }
+    if coverage_errors:
         raise LoRATargetValidationError(
-            "Every LoRA projection must appear exactly once in each hidden "
-            f"layer (expected {num_hidden_layers} each); got {wrong_counts}"
+            "Every LoRA projection must appear exactly once in every hidden "
+            f"layer; coverage errors: {coverage_errors}"
         )
 
     all_names = [name for names in matches.values() for name in names]
@@ -386,6 +447,7 @@ def validate_target_modules(
 
     return TargetModuleReport(
         num_hidden_layers=num_hidden_layers,
+        rank=rank,
         matches_by_target={
             name: tuple(sorted(names)) for name, names in matches.items()
         },
@@ -446,21 +508,223 @@ def attach_lora_adapter(
     return peft_model, target_report, parameter_report
 
 
-def build_lora_policy(config: LoRAPolicyConfig) -> LoRAPolicyBundle:
-    """Load local Qwen weights and return a fully audited PEFT policy."""
+def load_policy_model(
+    config: LoRAPolicyConfig,
+    *,
+    adapter_path: Optional[str] = None,
+) -> LoRAPolicyBundle:
+    """Unified policy loader for fresh or checkpointed trainable LoRA.
+
+    This is the model entry point intended for the stage-six GRPO trainer.
+    Omitting ``adapter_path`` initializes a new identity LoRA adapter; supplying
+    it reloads a previously saved adapter as trainable while still rebuilding
+    and auditing the frozen base model.
+    """
 
     model, tokenizer = load_base_policy_model_and_tokenizer(config)
-    peft_model, target_report, parameter_report = attach_lora_adapter(
-        model,
-        config,
-    )
+    if adapter_path is None:
+        peft_model, target_report, parameter_report = attach_lora_adapter(
+            model,
+            config,
+        )
+        resolved_adapter_path = None
+    else:
+        peft_model, target_report, parameter_report = load_saved_lora_adapter(
+            model,
+            config,
+            adapter_path,
+        )
+        resolved_adapter_path = str(Path(adapter_path).expanduser().resolve())
     return LoRAPolicyBundle(
         model=peft_model,
         tokenizer=tokenizer,
         config=config,
         target_report=target_report,
         parameter_report=parameter_report,
+        adapter_path=resolved_adapter_path,
     )
+
+
+def build_lora_policy(config: LoRAPolicyConfig) -> LoRAPolicyBundle:
+    """Backward-compatible name for initializing a fresh policy adapter."""
+
+    return load_policy_model(config)
+
+
+def load_saved_lora_adapter(
+    model: Any,
+    config: LoRAPolicyConfig,
+    adapter_path: str,
+    *,
+    peft_api: Optional[Any] = None,
+) -> Tuple[Any, TargetModuleReport, TrainableParameterReport]:
+    """Attach a local PEFT checkpoint and make only its A/B weights trainable."""
+
+    validate_model_architecture(model, config)
+    target_report = validate_target_modules(
+        model,
+        config.target_modules,
+        rank=config.r,
+    )
+    resolved_path = validate_local_adapter_directory(adapter_path, config)
+    if peft_api is None:
+        try:
+            import peft as peft_api
+        except ImportError as exc:
+            raise LoRAPolicyError(
+                "Reloading LoRA requires peft from requirements-train.txt"
+            ) from exc
+
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    peft_model = peft_api.PeftModel.from_pretrained(
+        model,
+        str(resolved_path),
+        is_trainable=True,
+        local_files_only=True,
+    )
+    _validate_peft_configuration(peft_model, config)
+    _validate_peft_target_coverage(peft_model, target_report)
+    _set_only_lora_parameters_trainable(peft_model)
+    parameter_report = audit_trainable_parameters(
+        peft_model,
+        target_report,
+        max_trainable_percentage=config.max_trainable_percentage,
+    )
+    peft_model.train()
+    return peft_model, target_report, parameter_report
+
+
+def save_lora_adapter(
+    bundle: LoRAPolicyBundle,
+    output_dir: str,
+) -> AdapterCheckpointReport:
+    """Save only adapter weights/config plus strict NavGPT provenance.
+
+    The destination must not already exist, preventing a smoke test or future
+    checkpoint operation from silently mixing files from different adapters.
+    """
+
+    output = Path(output_dir).expanduser().resolve()
+    if output.exists():
+        raise FileExistsError(
+            f"Adapter output already exists; refusing to overwrite: {output}"
+        )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    bundle.model.save_pretrained(
+        str(output),
+        safe_serialization=True,
+        selected_adapters=["default"],
+        save_embedding_layers=False,
+    )
+
+    adapter_config_path = output / "adapter_config.json"
+    weights_path = output / "adapter_model.safetensors"
+    if not adapter_config_path.is_file() or not weights_path.is_file():
+        raise LoRAPolicyError(
+            "PEFT save_pretrained did not create adapter_config.json and "
+            "adapter_model.safetensors"
+        )
+
+    config_sha256 = _sha256_file(adapter_config_path)
+    weights_sha256 = _sha256_file(weights_path)
+    base_config_path = (
+        Path(bundle.config.model_path).expanduser().resolve() / "config.json"
+    )
+    manifest = {
+        "schema_version": ADAPTER_MANIFEST_SCHEMA_VERSION,
+        "checkpoint_type": "navgpt_lora_adapter",
+        "base_model_path": str(base_config_path.parent),
+        "base_model_config_sha256": _sha256_file(base_config_path),
+        "adapter_config_sha256": config_sha256,
+        "adapter_weights_file": weights_path.name,
+        "adapter_weights_size_bytes": weights_path.stat().st_size,
+        "adapter_weights_sha256": weights_sha256,
+        "lora": {
+            "r": bundle.config.r,
+            "lora_alpha": bundle.config.lora_alpha,
+            "lora_dropout": bundle.config.lora_dropout,
+            "target_modules": list(bundle.config.target_modules),
+        },
+        "targets": bundle.target_report.as_dict(),
+        "parameters": bundle.parameter_report.as_dict(),
+    }
+    manifest_path = output / ADAPTER_MANIFEST_NAME
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    validate_local_adapter_directory(str(output), bundle.config)
+    return AdapterCheckpointReport(
+        path=str(output),
+        weights_file=weights_path.name,
+        weights_size_bytes=weights_path.stat().st_size,
+        weights_sha256=weights_sha256,
+        config_sha256=config_sha256,
+        manifest_file=manifest_path.name,
+    )
+
+
+def validate_local_adapter_directory(
+    adapter_path: str,
+    config: LoRAPolicyConfig,
+) -> Path:
+    """Validate a local NavGPT adapter and its required provenance manifest."""
+
+    path = Path(adapter_path).expanduser().resolve()
+    if not path.is_dir():
+        raise FileNotFoundError(f"LoRA adapter directory not found: {path}")
+    adapter_config_path = path / "adapter_config.json"
+    weights_path = path / "adapter_model.safetensors"
+    if not adapter_config_path.is_file():
+        raise FileNotFoundError(f"Missing PEFT adapter config: {adapter_config_path}")
+    if not weights_path.is_file():
+        raise FileNotFoundError(
+            f"Missing safe PEFT adapter weights: {weights_path}"
+        )
+
+    try:
+        adapter_config = json.loads(adapter_config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LoRAPolicyError(
+            f"Invalid adapter_config.json in {path}: {exc}"
+        ) from exc
+    expected_values = {
+        "r": config.r,
+        "lora_alpha": config.lora_alpha,
+        "lora_dropout": config.lora_dropout,
+        "bias": "none",
+        "use_rslora": False,
+        "use_dora": False,
+    }
+    mismatches = {
+        name: {"actual": adapter_config.get(name), "expected": expected}
+        for name, expected in expected_values.items()
+        if adapter_config.get(name) != expected
+    }
+    actual_targets = set(adapter_config.get("target_modules") or ())
+    if actual_targets != set(config.target_modules):
+        mismatches["target_modules"] = {
+            "actual": sorted(actual_targets),
+            "expected": sorted(config.target_modules),
+        }
+    if mismatches:
+        raise LoRAPolicyError(
+            f"Saved adapter config does not match the Policy request: {mismatches}"
+        )
+
+    manifest_path = path / ADAPTER_MANIFEST_NAME
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Missing NavGPT adapter provenance manifest: {manifest_path}"
+        )
+    _validate_adapter_manifest(
+        manifest_path,
+        adapter_config_path,
+        weights_path,
+        config,
+    )
+    return path
 
 
 def audit_trainable_parameters(
@@ -493,11 +757,46 @@ def audit_trainable_parameters(
             "Non-LoRA parameters remain trainable: " + ", ".join(unexpected[:20])
         )
 
-    expected_tensor_count = 2 * target_report.matched_module_count
+    expected_tensors = _expected_lora_tensors(target_report)
+    expected_tensor_count = len(expected_tensors)
     if len(trainable) != expected_tensor_count:
         raise LoRAParameterValidationError(
             "Expected one trainable lora_A and lora_B tensor for every target "
             f"module ({expected_tensor_count} tensors), got {len(trainable)}"
+        )
+
+    unmatched_names = set(trainable_names)
+    trainable_by_name = dict(trainable)
+    tensor_errors: Dict[str, Dict[str, Any]] = {}
+    for expected_suffix, expected_numel in expected_tensors.items():
+        matching_names = sorted(
+            name
+            for name in trainable_names
+            if name == expected_suffix or name.endswith(f".{expected_suffix}")
+        )
+        if len(matching_names) != 1:
+            tensor_errors[expected_suffix] = {
+                "matching_names": matching_names,
+                "expected_numel": expected_numel,
+            }
+            continue
+        actual_name = matching_names[0]
+        unmatched_names.discard(actual_name)
+        actual_numel = int(trainable_by_name[actual_name].numel())
+        if actual_numel != expected_numel:
+            tensor_errors[expected_suffix] = {
+                "actual_name": actual_name,
+                "actual_numel": actual_numel,
+                "expected_numel": expected_numel,
+            }
+    if unmatched_names:
+        tensor_errors["unexpected_trainable_tensors"] = {
+            "names": sorted(unmatched_names)
+        }
+    if tensor_errors:
+        raise LoRAParameterValidationError(
+            "Trainable LoRA tensors do not form the expected per-target A/B "
+            f"pairs: {tensor_errors}"
         )
 
     trainable_parameters = sum(int(parameter.numel()) for _, parameter in trainable)
@@ -539,19 +838,17 @@ def _validate_peft_target_coverage(
         raise LoRATargetValidationError(
             "PEFT model does not expose targeted_module_names for auditing"
         )
-    actual_counts = Counter(
-        str(name).rsplit(".", 1)[-1] for name in targeted_names
-    )
-    expected_counts = Counter(
-        {
-            name: len(matches)
-            for name, matches in target_report.matches_by_target.items()
-        }
-    )
-    if actual_counts != expected_counts:
+    actual_names = {str(name) for name in targeted_names}
+    expected_names = {
+        name
+        for matches in target_report.matches_by_target.values()
+        for name in matches
+    }
+    if actual_names != expected_names:
         raise LoRATargetValidationError(
-            "PEFT adapted a different target set than requested: expected "
-            f"{dict(expected_counts)}, got {dict(actual_counts)}"
+            "PEFT adapted a different target set than the pre-injection scan: "
+            f"missing={sorted(expected_names - actual_names)}, "
+            f"unexpected={sorted(actual_names - expected_names)}"
         )
 
 
@@ -600,6 +897,91 @@ def _validate_peft_configuration(
         raise LoRAParameterValidationError(
             f"PEFT adapter configuration differs from the request: {mismatches}"
         )
+
+
+def _validate_adapter_manifest(
+    manifest_path: Path,
+    adapter_config_path: Path,
+    weights_path: Path,
+    config: LoRAPolicyConfig,
+) -> None:
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LoRAPolicyError(
+            f"Invalid NavGPT adapter manifest {manifest_path}: {exc}"
+        ) from exc
+    if manifest.get("schema_version") != ADAPTER_MANIFEST_SCHEMA_VERSION:
+        raise LoRAPolicyError(
+            f"Unsupported adapter manifest schema in {manifest_path}"
+        )
+    if manifest.get("checkpoint_type") != "navgpt_lora_adapter":
+        raise LoRAPolicyError(f"Wrong checkpoint type in {manifest_path}")
+    expected_hashes = {
+        "adapter_config_sha256": _sha256_file(adapter_config_path),
+        "adapter_weights_sha256": _sha256_file(weights_path),
+        "base_model_config_sha256": _sha256_file(
+            Path(config.model_path).expanduser().resolve() / "config.json"
+        ),
+    }
+    mismatches = {
+        name: {"actual": manifest.get(name), "expected": expected}
+        for name, expected in expected_hashes.items()
+        if manifest.get(name) != expected
+    }
+    if manifest.get("adapter_weights_file") != weights_path.name:
+        mismatches["adapter_weights_file"] = {
+            "actual": manifest.get("adapter_weights_file"),
+            "expected": weights_path.name,
+        }
+    if manifest.get("adapter_weights_size_bytes") != weights_path.stat().st_size:
+        mismatches["adapter_weights_size_bytes"] = {
+            "actual": manifest.get("adapter_weights_size_bytes"),
+            "expected": weights_path.stat().st_size,
+        }
+    if mismatches:
+        raise LoRAPolicyError(
+            f"Adapter provenance validation failed: {mismatches}"
+        )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _hidden_layer_index(module_name: str) -> Optional[int]:
+    parts = module_name.split(".")
+    candidates = []
+    for index, part in enumerate(parts[:-1]):
+        if part != "layers":
+            continue
+        try:
+            candidates.append(int(parts[index + 1]))
+        except ValueError:
+            return None
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
+
+
+def _expected_lora_tensors(
+    target_report: TargetModuleReport,
+) -> Dict[str, int]:
+    expected: Dict[str, int] = {}
+    for module_name, (out_features, in_features) in (
+        target_report.weight_shapes.items()
+    ):
+        expected[f"{module_name}.lora_A.default.weight"] = (
+            target_report.rank * in_features
+        )
+        expected[f"{module_name}.lora_B.default.weight"] = (
+            out_features * target_report.rank
+        )
+    return expected
 
 
 def _set_only_lora_parameters_trainable(model: Any) -> None:
