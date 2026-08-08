@@ -816,52 +816,63 @@ def build_trl_grpo_config(
     if trl_module is None:
         trl_module = importlib.import_module("trl")
     max_completion_length = config.require_token_budget()
-    return trl_module.GRPOConfig(
-        output_dir=str(Path(config.output_dir).expanduser().resolve()),
-        per_device_train_batch_size=config.per_device_train_batch_size,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-        steps_per_generation=config.steps_per_generation,
-        num_generations=config.num_generations,
-        max_completion_length=max_completion_length,
-        max_tool_calling_iterations=config.max_tool_calling_iterations,
-        learning_rate=config.learning_rate,
-        weight_decay=config.weight_decay,
-        warmup_ratio=config.warmup_ratio,
-        max_grad_norm=config.max_grad_norm,
-        lr_scheduler_type=config.lr_scheduler_type,
-        optim="adamw_torch",
-        beta=config.beta,
-        temperature=config.temperature,
-        top_p=config.top_p,
-        scale_rewards="group",
-        loss_type="grpo",
-        mask_truncated_completions=False,
-        multi_objective_aggregation="sum_then_normalize",
-        reward_weights=[1.0],
-        remove_unused_columns=False,
-        bf16=config.mixed_precision == "bf16",
-        fp16=config.mixed_precision == "fp16",
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
+    config_kwargs = {
+        "output_dir": str(Path(config.output_dir).expanduser().resolve()),
+        "per_device_train_batch_size": config.per_device_train_batch_size,
+        "gradient_accumulation_steps": config.gradient_accumulation_steps,
+        "steps_per_generation": config.steps_per_generation,
+        "num_generations": config.num_generations,
+        "max_completion_length": max_completion_length,
+        "max_tool_calling_iterations": config.max_tool_calling_iterations,
+        "learning_rate": config.learning_rate,
+        "weight_decay": config.weight_decay,
+        "warmup_ratio": config.warmup_ratio,
+        "max_grad_norm": config.max_grad_norm,
+        "lr_scheduler_type": config.lr_scheduler_type,
+        "optim": "adamw_torch",
+        "beta": config.beta,
+        "temperature": config.temperature,
+        "top_p": config.top_p,
+        "scale_rewards": "group",
+        "loss_type": "grpo",
+        "mask_truncated_completions": False,
+        "multi_objective_aggregation": "sum_then_normalize",
+        "reward_weights": [1.0],
+        "remove_unused_columns": False,
+        "bf16": config.mixed_precision == "bf16",
+        "fp16": config.mixed_precision == "fp16",
+        "gradient_checkpointing": True,
+        "gradient_checkpointing_kwargs": {"use_reentrant": False},
         # GRPO compares policy/old/reference log-probabilities for the same
-        # tokens.  Training-time LoRA dropout would give those forwards
+        # tokens. Training-time LoRA dropout would give those forwards
         # different random masks and create artificial ratios/KL.
-        disable_dropout=True,
-        use_vllm=False,
-        max_steps=config.trainer_max_steps,
-        num_train_epochs=config.num_train_epochs,
-        logging_strategy="steps",
-        logging_steps=config.logging_steps,
-        logging_first_step=True,
-        save_strategy="steps",
-        save_steps=config.save_steps,
-        save_total_limit=config.save_total_limit,
-        save_only_model=False,
-        save_safetensors=True,
-        seed=config.seed,
-        data_seed=config.seed,
-        report_to="none",
+        "disable_dropout": True,
+        "use_vllm": False,
+        "max_steps": config.trainer_max_steps,
+        "num_train_epochs": config.num_train_epochs,
+        "logging_strategy": "steps",
+        "logging_steps": config.logging_steps,
+        "logging_first_step": True,
+        "save_strategy": "steps",
+        "save_steps": config.save_steps,
+        "save_total_limit": config.save_total_limit,
+        "save_only_model": False,
+        "seed": config.seed,
+        "data_seed": config.seed,
+        "report_to": "none",
+    }
+    config_parameters = inspect.signature(trl_module.GRPOConfig).parameters
+    accepts_var_kwargs = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in config_parameters.values()
     )
+    unsupported = set(config_kwargs).difference(config_parameters)
+    if unsupported and not accepts_var_kwargs:
+        raise GRPOContractError(
+            "Pinned GRPOConfig does not accept configured parameters: "
+            f"{sorted(unsupported)}"
+        )
+    return trl_module.GRPOConfig(**config_kwargs)
 
 
 def validate_grpo_policy_bundle(policy: Any) -> Dict[str, Any]:

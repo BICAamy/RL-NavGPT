@@ -120,6 +120,41 @@ class FakeGRPOConfig:
         use_vllm: bool,
         **kwargs: Any,
     ):
+        expected_base_kwargs = {
+            "output_dir",
+            "per_device_train_batch_size",
+            "gradient_accumulation_steps",
+            "learning_rate",
+            "weight_decay",
+            "warmup_ratio",
+            "max_grad_norm",
+            "lr_scheduler_type",
+            "optim",
+            "remove_unused_columns",
+            "bf16",
+            "fp16",
+            "gradient_checkpointing",
+            "gradient_checkpointing_kwargs",
+            "max_steps",
+            "num_train_epochs",
+            "logging_strategy",
+            "logging_steps",
+            "logging_first_step",
+            "save_strategy",
+            "save_steps",
+            "save_total_limit",
+            "save_only_model",
+            "seed",
+            "data_seed",
+            "report_to",
+        }
+        actual_base_kwargs = set(kwargs)
+        if actual_base_kwargs != expected_base_kwargs:
+            raise TypeError(
+                "FakeGRPOConfig keyword contract changed: "
+                f"missing={sorted(expected_base_kwargs - actual_base_kwargs)}, "
+                f"unexpected={sorted(actual_base_kwargs - expected_base_kwargs)}"
+            )
         values = dict(kwargs)
         values.update(
             num_generations=num_generations,
