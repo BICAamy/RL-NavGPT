@@ -178,6 +178,23 @@ def _run_level1() -> None:
     )
     for command in commands:
         subprocess.run(command, check=True)
+    probe = {
+        "viewpoint": "probe",
+        "obs": ["scene"] * 8,
+        "objects": [{} for _ in range(8)],
+        "candidate": {},
+        "heading": 0.0,
+        "elevation": 0.0,
+    }
+    _validate_token_audit_observation(probe)
+    try:
+        _validate_token_audit_observation(
+            {name: value for name, value in probe.items() if name != "viewpoint"}
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("Token audit accepted an observation without viewpoint")
     print("PASS stage-six validation level 1")
     print("- dependency, configuration, logging, and resume contracts passed")
 
@@ -379,12 +396,14 @@ def _build_initial_policy_prompt(
     viewpoint = str(item["path"][0])
     feature = view_db.get_image_observation(str(item["scan"]), viewpoint)
     observation = {
+        "viewpoint": viewpoint,
         "obs": feature["detail"],
         "objects": feature["objects"],
         "candidate": navigable[viewpoint],
         "heading": float(item.get("heading", 0.0)),
         "elevation": 0.0,
     }
+    _validate_token_audit_observation(observation)
     initial = builder.format_initial_observation(observation)
     policy_prompt = builder.build_policy_prompt(
         str(item["action_plan"]),
@@ -393,6 +412,24 @@ def _build_initial_policy_prompt(
     )
     messages = build_chat_messages(format_trl_navigation_observation(policy_prompt))
     return messages, observation
+
+
+def _validate_token_audit_observation(observation: Mapping[str, Any]) -> None:
+    """Keep direct token-audit observations aligned with real environment rows."""
+
+    required = {
+        "viewpoint",
+        "obs",
+        "objects",
+        "candidate",
+        "heading",
+        "elevation",
+    }
+    missing = required.difference(observation)
+    if missing:
+        raise RuntimeError(
+            f"Token-audit observation is missing fields: {sorted(missing)}"
+        )
 
 
 def _audit_token_budget(
@@ -498,12 +535,14 @@ def _audit_token_budget(
                     scan, target
                 )
                 observation = {
+                    "viewpoint": target,
                     "obs": feature["detail"],
                     "objects": feature["objects"],
                     "candidate": navigation[target],
                     "heading": float(pose["heading"]),
                     "elevation": float(pose["elevation"]),
                 }
+                _validate_token_audit_observation(observation)
                 valid_result = builder.format_tool_observation(observation, target)
                 invalid_result = builder.format_invalid_observation(
                     observation,
