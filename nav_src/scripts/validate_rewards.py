@@ -425,33 +425,50 @@ def validate_thought_reward() -> None:
 
 
 def validate_failed_episode_return() -> None:
-    calculator = CompositeRewardCalculator(
-        config=reward_config(navigation=True, semantic=False, thought=True),
-        text_feature_encoder=KeywordTextEncoder(),
-        fact_consistency_scorer=fact_scorer,
-    )
-    episode_return = 0.0
-    for _ in range(9):
-        episode_return += sum(calculator(transition()).components.values())
-    terminal = calculator(
-        transition(
-            parsed_output=finish_output(),
-            moved=False,
-            moved_path=(),
-            terminated=True,
-            success=False,
-            termination_reason="premature_finish",
+    def failed_episode(progress_steps: int):
+        calculator = CompositeRewardCalculator(
+            config=reward_config(navigation=True, semantic=False, thought=True),
+            text_feature_encoder=KeywordTextEncoder(),
+            fact_consistency_scorer=fact_scorer,
         )
-    )
-    episode_return += sum(terminal.components.values())
+        episode_return = 0.0
+        for _ in range(progress_steps):
+            episode_return += sum(calculator(transition()).components.values())
+        terminal = calculator(
+            transition(
+                parsed_output=finish_output(),
+                moved=False,
+                moved_path=(),
+                terminated=True,
+                success=False,
+                termination_reason="premature_finish",
+            )
+        )
+        episode_return += sum(terminal.components.values())
+        return calculator, terminal, episode_return
+
+    calculator, terminal, episode_return = failed_episode(9)
     require(episode_return <= -80.0,
             "A failed trajectory retained positive shaping return")
     require(
         terminal.diagnostics["navigation/failure_return_correction"] < 0.0,
         "Failure return ceiling did not report its correction",
     )
-    require(calculator.finalize_incomplete_return(120.0) == -80.0,
-            "External rollout cutoff retained positive shaping reward")
+    terminal_returns = [failed_episode(steps)[2] for steps in (1, 4, 9)]
+    require(terminal_returns == sorted(terminal_returns),
+            "Terminal failure shaping lost dense-reward ordering")
+    require(len({round(value, 8) for value in terminal_returns}) == 3,
+            "Terminal failed rollouts collapsed to one GRPO reward")
+    failed_returns = [
+        calculator.finalize_incomplete_return(value)
+        for value in (10.0, 40.0, 120.0)
+    ]
+    require(all(value < -80.0 for value in failed_returns),
+            "External rollout cutoff crossed the failure ceiling")
+    require(failed_returns == sorted(failed_returns),
+            "Failure shaping did not preserve dense-reward ordering")
+    require(len({round(value, 8) for value in failed_returns}) == 3,
+            "Distinct failed rollouts collapsed to one GRPO reward")
 
 
 def validate_composition_and_factory() -> None:

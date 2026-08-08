@@ -50,6 +50,8 @@ class NavigationRewardConfig:
     success_reward: float = 200.0
     failure_penalty: float = -80.0
     enforce_failure_return_ceiling: bool = True
+    failure_shaping_span: float = 20.0
+    failure_shaping_temperature: float = 100.0
 
     def __post_init__(self) -> None:
         _require_nonnegative("navigation weight", self.weight)
@@ -62,6 +64,18 @@ class NavigationRewardConfig:
             raise ValueError("invalid_streak_length must be positive")
         if not isinstance(self.enforce_failure_return_ceiling, bool):
             raise ValueError("enforce_failure_return_ceiling must be boolean")
+        if (
+            not math.isfinite(self.failure_shaping_span)
+            or self.failure_shaping_span <= 0.0
+        ):
+            raise ValueError("failure_shaping_span must be finite and positive")
+        if (
+            not math.isfinite(self.failure_shaping_temperature)
+            or self.failure_shaping_temperature <= 0.0
+        ):
+            raise ValueError(
+                "failure_shaping_temperature must be finite and positive"
+            )
         _require_nonnegative("progress_reward", self.progress_reward)
         _require_nonnegative(
             "subgoal_completion_reward",
@@ -138,6 +152,7 @@ COMPONENT_NAMES = (
     "navigation/subgoal_completion",
     "navigation/success",
     "navigation/failure",
+    "navigation/failure_shaping",
     "semantic/alignment_delta",
     "thought/subgoal_alignment",
     "thought/action_consistency",
@@ -252,15 +267,27 @@ class CompositeRewardCalculator:
             provisional_return = self._episode_component_sum + sum(
                 components.values()
             )
-            correction = min(0.0, failure_ceiling - provisional_return)
-            components["navigation/failure"] += correction
+            dense_return = provisional_return - failure_ceiling
+            shaped_return = self._shape_failed_episode_return(dense_return)
+            correction = shaped_return - provisional_return
+            components["navigation/failure_shaping"] = correction
             diagnostics.update(
                 {
                     "navigation/failure_return_ceiling": failure_ceiling,
+                    "navigation/failure_dense_return": dense_return,
                     "navigation/failure_return_before_correction": (
                         provisional_return
                     ),
+                    "navigation/failure_return_after_correction": shaped_return,
                     "navigation/failure_return_correction": correction,
+                    "navigation/failure_shaping_span": (
+                        navigation_config.weight
+                        * navigation_config.failure_shaping_span
+                    ),
+                    "navigation/failure_shaping_temperature": (
+                        navigation_config.weight
+                        * navigation_config.failure_shaping_temperature
+                    ),
                 }
             )
 
@@ -270,25 +297,56 @@ class CompositeRewardCalculator:
         diagnostics["reward/episode_sum"] = self._episode_component_sum
         return RewardResult(components=components, diagnostics=diagnostics)
 
-    def finalize_incomplete_return(self, episode_return: float) -> float:
-        """Score a rollout externally cut off before Gym terminal state.
+    def finalize_incomplete_return(
+        self,
+        episode_return: float,
+        *,
+        terminal_outcome_reward: float = 0.0,
+    ) -> float:
+        """Turn an incomplete or protocol-invalid rollout into a failure.
 
         TRL may stop a native tool conversation at its own tool-call or token
         limit.  Such a partial trajectory is a navigation failure, not a way to
-        retain only positive dense shaping.
+        retain only positive dense shaping.  If an otherwise terminal rollout
+        is invalidated by the tool protocol, ``terminal_outcome_reward`` removes
+        its already-awarded success/failure outcome before failure shaping is
+        applied again.
         """
 
         value = float(episode_return)
         if not math.isfinite(value):
             raise ValueError("episode_return must be finite")
+        outcome = float(terminal_outcome_reward)
+        if not math.isfinite(outcome):
+            raise ValueError("terminal_outcome_reward must be finite")
         config = self.config.navigation
         if (
             config.enabled
             and config.weight > 0.0
             and config.enforce_failure_return_ceiling
         ):
-            return min(value, config.weight * config.failure_penalty)
+            return self._shape_failed_episode_return(value - outcome)
         return value
+
+    def _shape_failed_episode_return(self, dense_return: float) -> float:
+        """Preserve bounded dense ordering while keeping failures below ceiling.
+
+        A hard ``min(return, failure_penalty)`` maps most early failed rollouts
+        to the same reward and therefore gives GRPO an all-zero group advantage.
+        This smooth monotonic map retains their ordering, has a finite lower
+        range, and approaches (but never exceeds) the configured failure
+        ceiling.
+        """
+
+        config = self.config.navigation
+        failure_ceiling = config.weight * config.failure_penalty
+        span = config.weight * config.failure_shaping_span
+        temperature = config.weight * config.failure_shaping_temperature
+        return (
+            failure_ceiling
+            - span
+            + span * math.tanh(float(dense_return) / temperature)
+        )
 
     def _navigation_reward(
         self,

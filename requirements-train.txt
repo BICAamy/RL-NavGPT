@@ -1,12 +1,13 @@
 -r requirements.txt
 
 # Stage 3: LoRA + GRPO training
-transformers>=5.2,<6
+transformers==5.14.1
 datasets
 gymnasium==1.3.0
 jmespath
-peft>=0.20,<0.21
-trl>=0.29,<0.30
+peft==0.20.0
+# ``environment_factory`` is experimental; stage six audits this exact API.
+trl==0.29.1
 
 # Stage 2 reward models
 Pillow

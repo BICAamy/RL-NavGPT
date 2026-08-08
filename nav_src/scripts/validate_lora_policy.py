@@ -34,6 +34,7 @@ from lora_policy import (  # noqa: E402
     attach_lora_adapter,
     audit_trainable_parameters,
     build_lora_policy,
+    fingerprint_local_model_weights,
     load_policy_model,
     load_base_policy_model_and_tokenizer,
     save_lora_adapter,
@@ -414,6 +415,7 @@ def validate_contract() -> None:
             "partial layer coverage rejected",
             "duplicate/missing layer cancellation rejected",
             "adapter checkpoint tampering rejected",
+            "base-model weight tampering rejected",
             "trainable backbone rejected",
         ],
     }
@@ -434,6 +436,9 @@ def validate_synthetic_adapter_checkpoint(
             json.dumps({"model_type": "qwen2", "num_hidden_layers": 2}),
             encoding="utf-8",
         )
+        base_weights_path = base_model_path / "model.safetensors"
+        base_weights = b"synthetic-base-model-weights"
+        base_weights_path.write_bytes(base_weights)
         config = LoRAPolicyConfig(model_path=str(base_model_path))
         bundle = LoRAPolicyBundle(
             model=peft_model,
@@ -448,6 +453,16 @@ def validate_synthetic_adapter_checkpoint(
             report.weights_file == "adapter_model.safetensors",
             "Wrong safe adapter filename",
         )
+        validate_local_adapter_directory(str(adapter_path), config)
+
+        base_weights_path.write_bytes(base_weights + b"-tampered")
+        try:
+            validate_local_adapter_directory(str(adapter_path), config)
+        except LoRAPolicyError:
+            pass
+        else:
+            raise AssertionError("Tampered base-model weights were accepted")
+        base_weights_path.write_bytes(base_weights)
         validate_local_adapter_directory(str(adapter_path), config)
 
         weights_path = adapter_path / report.weights_file
@@ -476,6 +491,18 @@ def validate_synthetic_local_load() -> None:
         (model_path / "model.safetensors.index.json").write_text(
             json.dumps({"weight_map": {"model.weight": shard_name}}),
             encoding="utf-8",
+        )
+        fingerprint = fingerprint_local_model_weights(str(model_path))
+        require(fingerprint["file_count"] == 1, "Wrong model weight file count")
+        require(
+            isinstance(fingerprint["index_sha256"], str)
+            and len(fingerprint["index_sha256"]) == 64,
+            "Indexed model fingerprint omitted the Safetensors index hash",
+        )
+        require(
+            fingerprint["files"]
+            == [{"name": shard_name, "size_bytes": 0}],
+            "Model weight fingerprint used the wrong indexed shard",
         )
 
         fake_torch = ModuleType("torch")

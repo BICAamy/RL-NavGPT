@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path
@@ -29,7 +30,10 @@ DEFAULT_LORA_TARGET_MODULES: Tuple[str, ...] = (
     "down_proj",
 )
 ADAPTER_MANIFEST_NAME = "navgpt_adapter_manifest.json"
-ADAPTER_MANIFEST_SCHEMA_VERSION = 1
+ADAPTER_MANIFEST_SCHEMA_VERSION = 2
+MODEL_WEIGHTS_FINGERPRINT_SCHEME = (
+    "sha256-relative-path-null-content-null-v1"
+)
 
 
 class LoRAPolicyError(RuntimeError):
@@ -268,6 +272,37 @@ def validate_local_model_directory(model_path: str) -> Path:
                 f"HF model directory is missing weight shards: {missing}"
             )
     return path
+
+
+def fingerprint_local_model_weights(model_path: str) -> Dict[str, Any]:
+    """Hash the exact Safetensors files that define a local base model.
+
+    The file set comes from ``model.safetensors.index.json`` when present, so
+    unrelated Safetensors files cannot silently enter or leave the identity.
+    The expensive content hash is cached only while the process is alive and
+    is keyed by every file's path, size, and nanosecond mtime.  Formal resume
+    therefore re-hashes the model in each new process, while repeated Trainer
+    checkpoints do not re-read the 14B base weights.
+    """
+
+    root = Path(model_path).expanduser().resolve()
+    files = _local_model_weight_files(root)
+    signature = _model_weight_signature(root, files)
+    digest = _fingerprint_model_weights_cached(str(root), signature)
+    index_path = root / "model.safetensors.index.json"
+    return {
+        "scheme": MODEL_WEIGHTS_FINGERPRINT_SCHEME,
+        "index_sha256": (
+            _sha256_file(index_path) if index_path.is_file() else None
+        ),
+        "file_count": len(signature),
+        "total_size_bytes": sum(size for _, size, _ in signature),
+        "files": [
+            {"name": name, "size_bytes": size}
+            for name, size, _ in signature
+        ],
+        "sha256": digest,
+    }
 
 
 def load_base_policy_model_and_tokenizer(
@@ -618,6 +653,24 @@ def save_lora_adapter(
         save_embedding_layers=False,
     )
 
+    return write_lora_adapter_manifest(bundle, str(output))
+
+
+def write_lora_adapter_manifest(
+    bundle: LoRAPolicyBundle,
+    adapter_dir: str,
+) -> AdapterCheckpointReport:
+    """Attach and verify NavGPT provenance for PEFT-written adapter files.
+
+    ``Trainer.save_model`` owns formal GRPO checkpoint serialization because it
+    must save every PEFT adapter used by TRL.  This helper adds the same strict
+    provenance used by :func:`save_lora_adapter` without saving or overwriting
+    model weights a second time.
+    """
+
+    output = Path(adapter_dir).expanduser().resolve()
+    if not output.is_dir():
+        raise FileNotFoundError(f"PEFT adapter directory not found: {output}")
     adapter_config_path = output / "adapter_config.json"
     weights_path = output / "adapter_model.safetensors"
     if not adapter_config_path.is_file() or not weights_path.is_file():
@@ -636,6 +689,9 @@ def save_lora_adapter(
         "checkpoint_type": "navgpt_lora_adapter",
         "base_model_path": str(base_config_path.parent),
         "base_model_config_sha256": _sha256_file(base_config_path),
+        "base_model_weights": fingerprint_local_model_weights(
+            bundle.config.model_path
+        ),
         "adapter_config_sha256": config_sha256,
         "adapter_weights_file": weights_path.name,
         "adapter_weights_size_bytes": weights_path.stat().st_size,
@@ -650,6 +706,11 @@ def save_lora_adapter(
         "parameters": bundle.parameter_report.as_dict(),
     }
     manifest_path = output / ADAPTER_MANIFEST_NAME
+    if manifest_path.exists():
+        raise FileExistsError(
+            "Adapter provenance manifest already exists; refusing to "
+            f"overwrite: {manifest_path}"
+        )
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -923,6 +984,9 @@ def _validate_adapter_manifest(
         "base_model_config_sha256": _sha256_file(
             Path(config.model_path).expanduser().resolve() / "config.json"
         ),
+        "base_model_weights": fingerprint_local_model_weights(
+            config.model_path
+        ),
     }
     mismatches = {
         name: {"actual": manifest.get(name), "expected": expected}
@@ -943,6 +1007,94 @@ def _validate_adapter_manifest(
         raise LoRAPolicyError(
             f"Adapter provenance validation failed: {mismatches}"
         )
+
+
+def _local_model_weight_files(root: Path) -> Tuple[Path, ...]:
+    if not root.is_dir():
+        raise FileNotFoundError(f"HF model directory not found: {root}")
+    index_path = root / "model.safetensors.index.json"
+    if index_path.is_file():
+        try:
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise LoRAModelValidationError(
+                f"Invalid Safetensors index {index_path}: {exc}"
+            ) from exc
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise LoRAModelValidationError(
+                f"Safetensors index has no non-empty weight_map: {index_path}"
+            )
+        names = sorted(set(str(name) for name in weight_map.values()))
+    else:
+        names = ["model.safetensors"]
+
+    files = []
+    for name in names:
+        candidate = (root / name).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise LoRAModelValidationError(
+                f"Safetensors index points outside the model directory: {name}"
+            ) from exc
+        if not candidate.is_file():
+            raise FileNotFoundError(
+                f"HF model directory is missing weight file: {candidate}"
+            )
+        files.append(candidate)
+    return tuple(files)
+
+
+def _model_weight_signature(
+    root: Path,
+    files: Sequence[Path],
+) -> Tuple[Tuple[str, int, int], ...]:
+    signature = []
+    for path in files:
+        stat = path.stat()
+        signature.append(
+            (
+                path.relative_to(root).as_posix(),
+                stat.st_size,
+                stat.st_mtime_ns,
+            )
+        )
+    return tuple(signature)
+
+
+@lru_cache(maxsize=8)
+def _fingerprint_model_weights_cached(
+    root_value: str,
+    signature: Tuple[Tuple[str, int, int], ...],
+) -> str:
+    root = Path(root_value)
+    digest = hashlib.sha256()
+    for relative_name, expected_size, expected_mtime_ns in signature:
+        path = root / relative_name
+        before = path.stat()
+        if (
+            before.st_size != expected_size
+            or before.st_mtime_ns != expected_mtime_ns
+        ):
+            raise LoRAModelValidationError(
+                f"Base-model weight changed before hashing: {path}"
+            )
+        digest.update(relative_name.encode("utf-8"))
+        digest.update(b"\0")
+        with path.open("rb") as file_obj:
+            for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\0")
+        after = path.stat()
+        if (
+            after.st_size != expected_size
+            or after.st_mtime_ns != expected_mtime_ns
+        ):
+            raise LoRAModelValidationError(
+                f"Base-model weight changed while hashing: {path}"
+            )
+    return digest.hexdigest()
 
 
 def _sha256_file(path: Path) -> str:
