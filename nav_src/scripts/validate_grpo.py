@@ -36,7 +36,9 @@ from grpo_training import (  # noqa: E402
     build_grpo_task_records,
     build_grpo_trainer,
     build_trl_grpo_config,
+    configure_qwen25_tool_response_schema,
     load_grpo_training_components,
+    seed_grpo_policy_initialization,
     validate_grpo_policy_bundle,
 )
 from navigation_rewards import (  # noqa: E402
@@ -316,7 +318,10 @@ class FakePolicyModel:
 def fake_policy(*, unfreeze_backbone: bool = False) -> Any:
     return SimpleNamespace(
         model=FakePolicyModel(unfreeze_backbone=unfreeze_backbone),
-        tokenizer=SimpleNamespace(chat_template="{{ messages }}"),
+        tokenizer=SimpleNamespace(
+            chat_template="{{ messages }}",
+            response_schema={"synthetic": True},
+        ),
         config=SimpleNamespace(dtype="bf16"),
         parameter_report=SimpleNamespace(
             trainable_tensor_count=2 if not unfreeze_backbone else 3,
@@ -669,6 +674,27 @@ def validate_environment_finalization() -> None:
 
 
 def validate_trainer_assembly(components: Any) -> None:
+    seeded: list[int] = []
+    seed_grpo_policy_initialization(
+        37,
+        transformers_module=SimpleNamespace(set_seed=seeded.append),
+    )
+    require(seeded == [37], "Fresh LoRA initialization is not explicitly seeded")
+
+    qwen_tokenizer = SimpleNamespace(
+        chat_template=(
+            "<tool_call>{{ tool_call.arguments }}</tool_call>"
+            "<tool_response>{{ content }}</tool_response><|im_end|>"
+        ),
+        response_schema=None,
+    )
+    configure_qwen25_tool_response_schema(qwen_tokenizer)
+    require(
+        qwen_tokenizer.response_schema["type"] == "object"
+        and "tool_calls" in qwen_tokenizer.response_schema["properties"],
+        "Qwen2.5 tool response schema was not attached",
+    )
+
     try:
         GRPOOptimizationConfig(output_dir="outputs/grpo").require_token_budget()
     except ValueError:

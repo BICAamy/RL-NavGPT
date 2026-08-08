@@ -15,4 +15,5 @@ datasets/*
 !datasets/.gitkeep
 
 models
+outputs/
 Modelfile

@@ -151,6 +151,26 @@ VisualFeatureProvider = Callable[[Mapping[str, Any]], Any]
 RewardCalculatorFactory = Callable[[], RewardCalculator]
 
 
+TRL_NAVIGATION_TOOL_PROTOCOL = (
+    "\n\nTRL tool protocol (this changes only the transport of the "
+    "decision, not its inner format): do not print the decision as "
+    "ordinary assistant text. Call `submit_navigation_decision` "
+    "exactly once per navigation step. Its `policy_output` argument "
+    "must contain exactly the canonical <Think>...</Think> followed "
+    "by <Action>...</Action> text specified above. After each tool "
+    "result, either call the same tool again or submit a canonical "
+    "finish action through it."
+)
+
+
+def format_trl_navigation_observation(policy_prompt: str) -> str:
+    """Return the exact text appended to a conversational TRL prompt."""
+
+    if not isinstance(policy_prompt, str) or not policy_prompt:
+        raise ValueError("policy_prompt must be a non-empty string")
+    return "\n\n" + policy_prompt + TRL_NAVIGATION_TOOL_PROTOCOL
+
+
 class NavGPTEnvironmentFactory:
     """Create isolated, identically initialized environments for rollout groups."""
 
@@ -366,18 +386,7 @@ class NavGPTTRLEnvironment:
         self._rollout_summary = None
         self._tool_call_count = 0
         self._protocol_violations = []
-        return (
-            "\n\n"
-            + prompt
-            + "\n\nTRL tool protocol (this changes only the transport of the "
-            "decision, not its inner format): do not print the decision as "
-            "ordinary assistant text. Call `submit_navigation_decision` "
-            "exactly once per navigation step. Its `policy_output` argument "
-            "must contain exactly the canonical <Think>...</Think> followed "
-            "by <Action>...</Action> text specified above. After each tool "
-            "result, either call the same tool again or submit a canonical "
-            "finish action through it."
-        )
+        return format_trl_navigation_observation(prompt)
 
     def _get_accumulated_reward(self) -> float:
         """Private reward accessor; private methods are not TRL tools."""

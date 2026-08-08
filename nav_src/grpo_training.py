@@ -10,6 +10,7 @@ CLIP weights.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import copy
 import hashlib
 import importlib
 import inspect
@@ -41,6 +42,50 @@ from rl_env import (
 SUPPORTED_TRL_VERSION = "0.29.1"
 SUPPORTED_TRANSFORMERS_VERSION = "5.14.1"
 SUPPORTED_PEFT_VERSION = "0.20.0"
+
+# Transformers 5 response parsing schema for the XML tool-call envelope used
+# by the local Qwen2.5 chat template. TRL 0.29.1 ships the same parser for
+# Qwen3 but does not auto-recognize Qwen2.5, even though their tool envelopes
+# are identical.
+QWEN25_TOOL_RESPONSE_SCHEMA: Dict[str, Any] = {
+    "x-regex": (
+        r"^(?:<think>\n?(?:(?P<reasoning_content>.*?\S.*?)\n?|[\s]*)"
+        r"</think>\s*)?(?P<content>.*?)(?:\n(?=<tool_call>))?"
+        r"(?=(?:<tool_call>|<\|im_end\|>|$))"
+        r"(?P<tool_calls>(?:<tool_call>.+?</tool_call>\s*)+)?\s*"
+        r"(?:<\|im_end\|>|$)"
+    ),
+    "type": "object",
+    "properties": {
+        "role": {"const": "assistant"},
+        "content": {"type": "string"},
+        "reasoning_content": {"type": "string"},
+        "tool_calls": {
+            "type": "array",
+            "x-regex-iterator": r"<tool_call>\s*(.+?)\s*</tool_call>",
+            "items": {
+                "x-parser": "json",
+                "x-parser-args": {
+                    "transform": "{type: 'function', function: @}"
+                },
+                "type": "object",
+                "properties": {
+                    "type": {"const": "function"},
+                    "function": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "arguments": {
+                                "type": "object",
+                                "additionalProperties": {},
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+}
 
 
 class GRPOContractError(RuntimeError):
@@ -942,6 +987,27 @@ def validate_grpo_policy_bundle(policy: Any) -> Dict[str, Any]:
     }
 
 
+def configure_qwen25_tool_response_schema(tokenizer: Any) -> None:
+    """Attach the missing Transformers response parser for Qwen2.5 tools."""
+
+    if getattr(tokenizer, "response_schema", None) is not None:
+        return
+    chat_template = str(getattr(tokenizer, "chat_template", ""))
+    required_markers = (
+        "<tool_call>",
+        "tool_call.arguments",
+        "<tool_response>",
+        "<|im_end|>",
+    )
+    missing = [marker for marker in required_markers if marker not in chat_template]
+    if missing:
+        raise GRPOContractError(
+            "Qwen tokenizer chat template is incompatible with the pinned "
+            f"tool response schema; missing markers: {missing}"
+        )
+    tokenizer.response_schema = copy.deepcopy(QWEN25_TOOL_RESPONSE_SCHEMA)
+
+
 def build_grpo_trainer(
     policy: Any,
     components: GRPOTrainingComponents,
@@ -979,6 +1045,7 @@ def build_grpo_trainer(
             f"{component_output_dir} versus {optimization_output_dir}"
         )
     args = build_trl_grpo_config(optimization, trl_module=trl_module)
+    configure_qwen25_tool_response_schema(policy.tokenizer)
     from grpo_runtime import (
         NavigationMetricsRecorder,
         make_recording_environment_reward,
@@ -1034,6 +1101,12 @@ def load_policy_and_build_grpo_trainer(
 
     from lora_policy import PolicyModelLoader
 
+    # The LoRA A matrices are randomly initialized before GRPOTrainer exists.
+    # Seed immediately before loading the policy so a fresh uninterrupted run
+    # and a fresh run that will later be resumed start from identical adapter
+    # weights.  GRPOTrainer seeds sampling again during its own construction.
+    seed_grpo_policy_initialization(optimization.seed)
+
     component_model_path = Path(
         components.config.paths.resolved().policy_model_path
     )
@@ -1045,3 +1118,20 @@ def load_policy_and_build_grpo_trainer(
         )
     policy = PolicyModelLoader(policy_config).load(adapter_path=adapter_path)
     return build_grpo_trainer(policy, components, optimization)
+
+
+def seed_grpo_policy_initialization(
+    seed: int,
+    *,
+    transformers_module: Optional[ModuleType] = None,
+) -> None:
+    """Seed fresh LoRA initialization before GRPOTrainer is constructed."""
+
+    if transformers_module is None:
+        transformers_module = importlib.import_module("transformers")
+    set_seed = getattr(transformers_module, "set_seed", None)
+    if not callable(set_seed):
+        raise GRPOContractError(
+            "Pinned Transformers runtime does not expose set_seed()"
+        )
+    set_seed(int(seed))
