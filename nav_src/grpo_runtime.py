@@ -421,6 +421,7 @@ def build_grpo_run_manifest(
             Path(__file__).resolve().parent,
             required=(
                 "distributed_runtime.py",
+                "grpo_eval_artifacts.py",
                 "grpo_runtime.py",
                 "grpo_training.py",
                 "grpo_validation.py",

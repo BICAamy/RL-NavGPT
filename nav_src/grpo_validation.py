@@ -4,15 +4,17 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-import json
-import os
 from pathlib import Path
 import random
-import shutil
 from typing import Any, Dict, Iterator, Mapping, Optional, Sequence
 
 from action_plan_cache import canonical_json, sha256_file, sha256_text
-from lora_policy import ADAPTER_MANIFEST_NAME, validate_local_adapter_directory
+from grpo_eval_artifacts import (
+    BestSelector,
+    EvaluationQueue,
+    EvaluationSnapshotStore,
+    completed_candidate,
+)
 from r2r_evaluation import (
     R2REvaluationConfig,
     ResumableEvaluationStore,
@@ -22,7 +24,6 @@ from r2r_evaluation import (
     load_fast_subset_manifest,
     load_validation_dataset,
     prepare_fast_subset_manifest,
-    selection_key,
 )
 
 
@@ -97,6 +98,7 @@ class GRPOValidationManager:
         self.output_dir = Path(output_dir).expanduser().resolve()
         self.validation_dir = self.output_dir / "validation"
         self.state_path = self.validation_dir / "state.json"
+        self.queue_path = self.validation_dir / "queue.json"
         self.run_fingerprint = str(run_fingerprint)
         self.distributed = distributed_context
         dataset = load_validation_dataset(config.evaluation)
@@ -111,18 +113,35 @@ class GRPOValidationManager:
             dataset.config.connectivity_dir,
             graph_cache=self.factory.graph_cache,
         )
-        self.distributed.call_on_main_and_broadcast(self._initialize_state)
+        fingerprint = str(self.contract["validation_fingerprint"])
+        self.snapshots = EvaluationSnapshotStore(
+            str(self.validation_dir / "snapshots"),
+            policy_config=self.policy.config,
+            run_fingerprint=self.run_fingerprint,
+            validation_fingerprint=fingerprint,
+        )
+        self.queue = EvaluationQueue(
+            str(self.queue_path),
+            run_fingerprint=self.run_fingerprint,
+            validation_fingerprint=fingerprint,
+        )
+        self.selector = BestSelector(
+            str(self.state_path),
+            run_fingerprint=self.run_fingerprint,
+            validation_fingerprint=fingerprint,
+        )
+        self.distributed.call_on_main_and_broadcast(self._initialize_artifacts)
 
     def resume_pending(self, *, current_step: int) -> None:
-        state = self._state()
-        pending = state.get("pending")
-        if pending is None:
-            return
-        if int(pending["step"]) != int(current_step):
-            raise GRPOValidationError(
-                f"Pending validation is step {pending['step']}, not {current_step}"
-            )
-        self._execute(pending)
+        pending = self.distributed.call_on_main_and_broadcast(
+            lambda: list(self.queue.pending_events())
+        )
+        for event in pending:
+            if int(event["step"]) != int(current_step):
+                raise GRPOValidationError(
+                    f"Pending validation is step {event['step']}, not {current_step}"
+                )
+            self._execute_event(event)
 
     def run_scheduled_checkpoint(
         self,
@@ -135,77 +154,98 @@ class GRPOValidationManager:
     ) -> None:
         if not fast_due and not epoch_due:
             return
-        workflow = {
+        event = {
+            "event_id": (
+                f"step-{int(step)}-fast-{int(bool(fast_due))}"
+                f"-epoch-{int(bool(epoch_due))}"
+            ),
             "step": int(step),
-            "candidate_path": str(Path(checkpoint_path).resolve()),
+            "source_path": str(Path(checkpoint_path).resolve()),
             "fast_due": bool(fast_due),
             "epoch_due": bool(epoch_due),
             "epoch": epoch,
         }
-        pending = self.distributed.call_on_main_and_broadcast(
-            lambda: self._begin(workflow)
+        queued = self.distributed.call_on_main_and_broadcast(
+            lambda: self.queue.enqueue_event(event)
         )
-        if not pending.get("complete"):
-            self._execute(pending)
+        if queued["status"] != "completed":
+            self._execute_event(queued)
 
-    def _execute(self, workflow: Mapping[str, Any]) -> None:
-        step = int(workflow["step"])
-        path = str(workflow["candidate_path"])
-        if workflow["fast_due"]:
-            result = self._evaluate(step, path, "fast", self.fast_ids, current=True)
-            self.distributed.call_on_main_and_broadcast(
-                lambda: self._record_fast(step, path, result["metrics"])
+    def _execute_event(self, event: Mapping[str, Any]) -> None:
+        event_id = str(event["event_id"])
+        event = self.distributed.call_on_main_and_broadcast(
+            lambda: self.queue.update_event(event_id, status="running")
+        )
+        snapshot = self.distributed.call_on_main_and_broadcast(
+            lambda: self._snapshot_event(event_id)
+        )
+        if event["fast_due"]:
+            fast_job = self.distributed.call_on_main_and_broadcast(
+                lambda: self._enqueue_job(snapshot, "fast")
             )
-        if workflow["epoch_due"]:
-            current = self._evaluate(step, path, "full", self.full_ids, current=True)
-            state = self._state()
-            quick = state.get("quick_best")
-            quick_metrics = None
-            if quick is not None:
-                if int(quick["step"]) == step:
-                    quick_metrics = current["metrics"]
-                else:
-                    quick_metrics = self._evaluate(
-                        int(quick["step"]),
-                        str(quick["adapter_path"]),
-                        "full",
-                        self.full_ids,
-                        current=False,
-                    )["metrics"]
+            completed = self._run_job(fast_job)
             self.distributed.call_on_main_and_broadcast(
-                lambda: self._record_epoch(
-                    step=step,
-                    epoch=workflow.get("epoch"),
-                    source_path=path,
-                    metrics=current["metrics"],
-                    quick=quick,
-                    quick_metrics=quick_metrics,
+                lambda: self.selector.record_fast(completed)
+            )
+            self.distributed.call_on_main_and_broadcast(
+                lambda: self.queue.update_event(
+                    event_id, fast_job_id=str(fast_job["job_id"])
+                )
+            )
+        if event["epoch_due"]:
+            full_candidates = self.distributed.call_on_main_and_broadcast(
+                lambda: self._prepare_full_candidates(event_id, snapshot)
+            )
+            for candidate in full_candidates:
+                self._run_job(
+                    self.distributed.call_on_main_and_broadcast(
+                        lambda candidate=candidate: self.queue.job(
+                            candidate["job_id"]
+                        )
+                    )
+                )
+            self.distributed.call_on_main_and_broadcast(
+                lambda: self._select_epoch(
+                    event_id,
+                    step=int(event["step"]),
+                    epoch=event.get("epoch"),
                 )
             )
         self.distributed.call_on_main_and_broadcast(
-            lambda: self._finish(workflow)
+            lambda: self.queue.update_event(event_id, status="completed")
+        )
+
+    def _run_job(self, job: Mapping[str, Any]) -> Dict[str, Any]:
+        if job["status"] == "completed":
+            return dict(job)
+        running = self.distributed.call_on_main_and_broadcast(
+            lambda: self.queue.mark_running(str(job["job_id"]))
+        )
+        result = self._evaluate(running)
+        return self.distributed.call_on_main_and_broadcast(
+            lambda: self.queue.mark_completed(str(job["job_id"]), result)
         )
 
     def _evaluate(
         self,
-        step: int,
-        adapter_path: str,
-        mode: str,
-        instr_ids: Sequence[str],
-        *,
-        current: bool,
+        job: Mapping[str, Any],
     ) -> Dict[str, Any]:
-        adapter = validate_local_adapter_directory(adapter_path, self.policy.config)
+        mode = str(job["mode"])
+        step = int(job["step"])
+        instr_ids = self.fast_ids if mode == "fast" else self.full_ids
+        snapshot = self.snapshots.validate(
+            str(job["snapshot"]["path"]), expected_step=step
+        )
         manifest = {
             "run_fingerprint": self.run_fingerprint,
             "validation_fingerprint": self.contract["validation_fingerprint"],
+            "job_id": str(job["job_id"]),
             "mode": mode,
             "step": step,
-            "adapter_weights_sha256": sha256_file(
-                adapter / "adapter_model.safetensors"
-            ),
+            "snapshot_fingerprint": snapshot.fingerprint,
+            "adapter_weights_sha256": snapshot.weights_sha256,
         }
-        output = self.validation_dir / "evaluations" / mode / f"step-{step}"
+        output = Path(str(job["output_path"]))
         self.distributed.call_on_main_and_broadcast(
             lambda: _initialize_store(
                 output, manifest, instr_ids, self.distributed.world_size
@@ -220,7 +260,7 @@ class GRPOValidationManager:
         )
         with frozen_policy_evaluation(
             self.policy,
-            None if current else str(adapter),
+            snapshot.path,
         ):
             local = evaluate_policy_shard(
                 self.policy.model,
@@ -240,164 +280,107 @@ class GRPOValidationManager:
         self.distributed.barrier()
         return result
 
-    def _record_fast(
-        self, step: int, source_path: str, metrics: Mapping[str, Any]
-    ) -> Dict[str, Any]:
-        state = self._read_state()
-        if any(int(row["step"]) == step for row in state["fast_history"]):
-            return state
-        previous = state.get("quick_best")
-        improved = previous is None or selection_key(metrics, step=step) > selection_key(
-            previous["metrics"], step=int(previous["step"])
+    def _initialize_artifacts(self) -> Dict[str, Any]:
+        return {
+            "queue": self.queue.initialize(),
+            "selector": self.selector.initialize(),
+        }
+
+    def _snapshot_event(self, event_id: str) -> Dict[str, Any]:
+        event = next(
+            row
+            for row in self.queue.read()["events"]
+            if row["event_id"] == event_id
         )
-        pinned = self._pin(source_path, step) if improved else None
-        if improved:
-            state["quick_best"] = {
+        if event["snapshot"] is None:
+            snapshot = self.snapshots.create(
+                str(event["source_path"]), step=int(event["step"])
+            )
+            event = self.queue.update_event(event_id, snapshot=snapshot.as_dict())
+        else:
+            value = event["snapshot"]
+            snapshot = self.snapshots.validate(
+                str(value["path"]), expected_step=int(event["step"])
+            )
+            if canonical_json(snapshot.as_dict()) != canonical_json(value):
+                raise GRPOValidationError("Queued eval snapshot identity changed")
+        return dict(event["snapshot"])
+
+    def _enqueue_job(
+        self, snapshot: Mapping[str, Any], mode: str
+    ) -> Dict[str, Any]:
+        step = int(snapshot["step"])
+        job_id = f"{mode}-step-{step}"
+        return self.queue.enqueue_job(
+            {
+                "job_id": job_id,
+                "mode": mode,
                 "step": step,
-                "adapter_path": pinned,
-                "metrics": dict(metrics),
+                "snapshot": dict(snapshot),
+                "output_path": str(
+                    self.validation_dir / "evaluations" / mode / f"step-{step}"
+                ),
             }
-        state["fast_history"].append(
-            {"step": step, "metrics": dict(metrics), "improved": improved}
         )
-        self._write_state(state)
-        return state
 
-    def _record_epoch(
-        self,
-        *,
-        step: int,
-        epoch: Any,
-        source_path: str,
-        metrics: Mapping[str, Any],
-        quick: Optional[Mapping[str, Any]],
-        quick_metrics: Optional[Mapping[str, Any]],
+    def _prepare_full_candidates(
+        self, event_id: str, current_snapshot: Mapping[str, Any]
+    ) -> Sequence[Dict[str, Any]]:
+        event = next(
+            row
+            for row in self.queue.read()["events"]
+            if row["event_id"] == event_id
+        )
+        if event["full_candidates"]:
+            return tuple(event["full_candidates"])
+        grouped: Dict[str, Dict[str, Any]] = {
+            str(current_snapshot["fingerprint"]): {
+                "snapshot": dict(current_snapshot),
+                "roles": ["epoch_end"],
+            }
+        }
+        quick = self.selector.read().get("quick_best")
+        if quick is not None:
+            fingerprint = str(quick["snapshot_fingerprint"])
+            if fingerprint in grouped:
+                grouped[fingerprint]["roles"].append("quick_best")
+            else:
+                snapshot = self.snapshots.validate(
+                    str(quick["adapter_path"]), expected_step=int(quick["step"])
+                )
+                grouped[fingerprint] = {
+                    "snapshot": snapshot.as_dict(),
+                    "roles": ["quick_best"],
+                }
+        candidates = []
+        for value in grouped.values():
+            job = self._enqueue_job(value["snapshot"], "full")
+            candidates.append(
+                {"job_id": str(job["job_id"]), "roles": list(value["roles"])}
+            )
+        self.queue.update_event(event_id, full_candidates=candidates)
+        return tuple(candidates)
+
+    def _select_epoch(
+        self, event_id: str, *, step: int, epoch: Any
     ) -> Dict[str, Any]:
-        state = self._read_state()
-        if any(int(row["step"]) == step for row in state["epoch_history"]):
-            return state
+        event = next(
+            row
+            for row in self.queue.read()["events"]
+            if row["event_id"] == event_id
+        )
         candidates = [
-            {"role": "epoch_end", "step": step, "path": source_path, "metrics": dict(metrics)}
+            completed_candidate(
+                self.queue.job(str(value["job_id"])), roles=value["roles"]
+            )
+            for value in event["full_candidates"]
         ]
-        if quick is not None and quick_metrics is not None:
-            candidates.append(
-                {
-                    "role": "quick_best",
-                    "step": int(quick["step"]),
-                    "path": str(quick["adapter_path"]),
-                    "metrics": dict(quick_metrics),
-                }
-            )
-        if state.get("full_best") is not None:
-            old = state["full_best"]
-            candidates.append(
-                {
-                    "role": "previous_full_best",
-                    "step": int(old["step"]),
-                    "path": str(old["adapter_path"]),
-                    "metrics": dict(old["metrics"]),
-                }
-            )
-        winner = max(
-            candidates,
-            key=lambda row: selection_key(row["metrics"], step=int(row["step"])),
+        return self.selector.record_epoch(
+            event_id=event_id,
+            step=step,
+            epoch=epoch,
+            candidates=candidates,
         )
-        state["full_best"] = {
-            "step": int(winner["step"]),
-            "adapter_path": self._pin(winner["path"], int(winner["step"])),
-            "metrics": winner["metrics"],
-            "selected_role": winner["role"],
-        }
-        state["epoch_history"].append(
-            {"step": step, "epoch": epoch, "winner": state["full_best"]}
-        )
-        self._write_state(state)
-        return state
-
-    def _pin(self, source_path: str, step: int) -> str:
-        source = validate_local_adapter_directory(source_path, self.policy.config)
-        destination = self.validation_dir / "pinned" / f"step-{step}"
-        if destination.exists():
-            validate_local_adapter_directory(str(destination), self.policy.config)
-            if sha256_file(destination / "adapter_model.safetensors") != sha256_file(
-                source / "adapter_model.safetensors"
-            ):
-                raise GRPOValidationError(f"Pinned adapter differs: {destination}")
-            return str(destination)
-        destination.mkdir(parents=True)
-        for name in (
-            "adapter_config.json",
-            "adapter_model.safetensors",
-            ADAPTER_MANIFEST_NAME,
-        ):
-            shutil.copy2(source / name, destination / name)
-        return str(destination)
-
-    def _initialize_state(self) -> Dict[str, Any]:
-        if self.state_path.exists():
-            state = self._read_state()
-            self._check_state(state)
-            return state
-        state = {
-            "schema_version": 1,
-            "run_fingerprint": self.run_fingerprint,
-            "validation_fingerprint": self.contract["validation_fingerprint"],
-            "pending": None,
-            "quick_best": None,
-            "full_best": None,
-            "fast_history": [],
-            "epoch_history": [],
-            "completed_workflows": [],
-        }
-        self._write_state(state)
-        return state
-
-    def _begin(self, workflow: Mapping[str, Any]) -> Dict[str, Any]:
-        state = self._read_state()
-        if state["pending"] is not None:
-            if canonical_json(state["pending"]) != canonical_json(workflow):
-                raise GRPOValidationError("Another validation workflow is pending")
-            return state["pending"]
-        if any(
-            int(row["step"]) == int(workflow["step"])
-            and row["fast_due"] == workflow["fast_due"]
-            and row["epoch_due"] == workflow["epoch_due"]
-            for row in state["completed_workflows"]
-        ):
-            return {**dict(workflow), "complete": True}
-        state["pending"] = dict(workflow)
-        self._write_state(state)
-        return dict(workflow)
-
-    def _finish(self, workflow: Mapping[str, Any]) -> Dict[str, Any]:
-        state = self._read_state()
-        state["completed_workflows"].append(dict(workflow))
-        state["pending"] = None
-        self._write_state(state)
-        return state
-
-    def _state(self) -> Dict[str, Any]:
-        return self.distributed.call_on_main_and_broadcast(self._read_state)
-
-    def _read_state(self) -> Dict[str, Any]:
-        return json.loads(self.state_path.read_text(encoding="utf-8"))
-
-    def _write_state(self, state: Mapping[str, Any]) -> None:
-        self.validation_dir.mkdir(parents=True, exist_ok=True)
-        temporary = self.state_path.with_suffix(".json.tmp")
-        temporary.write_text(
-            json.dumps(state, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(temporary, self.state_path)
-
-    def _check_state(self, state: Mapping[str, Any]) -> None:
-        if (
-            state.get("run_fingerprint") != self.run_fingerprint
-            or state.get("validation_fingerprint")
-            != self.contract["validation_fingerprint"]
-        ):
-            raise GRPOValidationError("Validation state belongs to another run")
 
 
 def make_grpo_validation_callback(
@@ -424,7 +407,9 @@ def make_grpo_validation_callback(
             if step in self.saved_steps:
                 manager.run_scheduled_checkpoint(
                     step=step,
-                    checkpoint_path=str(Path(args.output_dir).resolve() / f"checkpoint-{step}"),
+                    checkpoint_path=str(
+                        Path(args.output_dir).resolve() / f"checkpoint-{step}"
+                    ),
                     fast_due=False,
                     epoch_due=True,
                     epoch=epoch,
@@ -441,7 +426,9 @@ def make_grpo_validation_callback(
             epoch = self.epoch_steps.pop(step, None)
             manager.run_scheduled_checkpoint(
                 step=step,
-                checkpoint_path=str(Path(args.output_dir).resolve() / f"checkpoint-{step}"),
+                checkpoint_path=str(
+                    Path(args.output_dir).resolve() / f"checkpoint-{step}"
+                ),
                 fast_due=bool(step and step % manager.config.fast_interval_steps == 0),
                 epoch_due=epoch is not None,
                 epoch=epoch,

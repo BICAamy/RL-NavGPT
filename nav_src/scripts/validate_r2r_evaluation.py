@@ -15,6 +15,14 @@ NAV_SRC = Path(__file__).resolve().parents[1]
 if str(NAV_SRC) not in sys.path:
     sys.path.insert(0, str(NAV_SRC))
 
+from grpo_eval_artifacts import (  # noqa: E402
+    ADAPTER_FILES,
+    BestSelector,
+    EvaluationArtifactError,
+    EvaluationQueue,
+    EvaluationSnapshotStore,
+    completed_candidate,
+)
 from grpo_validation import make_grpo_validation_callback  # noqa: E402
 from r2r_evaluation import (  # noqa: E402
     ResumableEvaluationStore,
@@ -135,6 +143,108 @@ def main() -> None:
             "Final coverage changed",
         )
 
+        adapter = root / "checkpoint-1000"
+        adapter.mkdir()
+        for name in ADAPTER_FILES:
+            (adapter / name).write_text(f"{name}:1000\n", encoding="utf-8")
+        snapshots = EvaluationSnapshotStore(
+            str(root / "snapshots"),
+            policy_config=None,
+            run_fingerprint="run",
+            validation_fingerprint="validation",
+            adapter_validator=lambda value: Path(value).resolve(),
+        )
+        snapshot = snapshots.create(str(adapter), step=1_000)
+        adapter.joinpath("adapter_model.safetensors").write_text(
+            "changed\n", encoding="utf-8"
+        )
+        try:
+            snapshots.create(str(adapter), step=1_000)
+        except EvaluationArtifactError:
+            pass
+        else:
+            raise AssertionError("Snapshot silently followed a changed checkpoint")
+        snapshot_weights = Path(snapshot.path) / "adapter_model.safetensors"
+        snapshot_weights.write_text("tampered\n", encoding="utf-8")
+        try:
+            snapshots.validate(snapshot.path, expected_step=1_000)
+        except EvaluationArtifactError:
+            pass
+        else:
+            raise AssertionError("Tampered snapshot passed validation")
+        snapshot_weights.write_text(
+            "adapter_model.safetensors:1000\n", encoding="utf-8"
+        )
+        snapshots.validate(snapshot.path, expected_step=1_000)
+
+        queue = EvaluationQueue(
+            str(root / "queue.json"),
+            run_fingerprint="run",
+            validation_fingerprint="validation",
+        )
+        queue.initialize()
+        event = queue.enqueue_event(
+            {
+                "event_id": "step-1000-fast-1-epoch-0",
+                "step": 1_000,
+                "source_path": str(adapter),
+                "fast_due": True,
+                "epoch_due": False,
+                "epoch": None,
+            }
+        )
+        queue.update_event(event["event_id"], snapshot=snapshot.as_dict())
+        job = queue.enqueue_job(
+            {
+                "job_id": "fast-step-1000",
+                "mode": "fast",
+                "step": 1_000,
+                "snapshot": snapshot.as_dict(),
+                "output_path": str(root / "fast-1000"),
+            }
+        )
+        queue.mark_running(job["job_id"])
+        fast_metrics = {"spl": 50, "sr": 60, "nDTW": 70, "nav_error": 4}
+        completed_fast = queue.mark_completed(
+            job["job_id"], {"count": 128, "metrics": fast_metrics}
+        )
+        require(
+            EvaluationQueue(
+                str(root / "queue.json"),
+                run_fingerprint="run",
+                validation_fingerprint="validation",
+            ).job(job["job_id"])["status"]
+            == "completed",
+            "Evaluation queue did not survive reload",
+        )
+
+        selector = BestSelector(
+            str(root / "best.json"),
+            run_fingerprint="run",
+            validation_fingerprint="validation",
+        )
+        selector.initialize()
+        selector.record_fast(completed_fast)
+        full_job = {
+            **completed_fast,
+            "job_id": "full-step-1000",
+            "mode": "full",
+            "result": {"count": 6, "metrics": fast_metrics},
+        }
+        full_candidate = completed_candidate(full_job, roles=("epoch_end",))
+        selected = selector.record_epoch(
+            event_id="epoch-1",
+            step=1_000,
+            epoch=1.0,
+            candidates=[full_candidate],
+        )
+        require(
+            selected["full_best"]["adapter_path"] == snapshot.path,
+            "Best selector did not retain the immutable snapshot",
+        )
+        queue.update_event(event["event_id"], status="completed")
+        require(not queue.pending_events(), "Completed event remained queued")
+
         strong = {"spl": 50, "sr": 60, "nDTW": 70, "nav_error": 4}
         weak = {"spl": 49, "sr": 99, "nDTW": 99, "nav_error": 0}
         require(
@@ -163,6 +273,8 @@ def main() -> None:
     print("PASS R2R validation contract")
     print("- fixed Val-Unseen subset and standard metrics")
     print("- rank JSONL recovery and exact coverage")
+    print("- immutable eval snapshot and resumable evaluation queue")
+    print("- SPL-first quick/full best selector")
     print("- 1000-step fast plus epoch-end full scheduling")
 
 
