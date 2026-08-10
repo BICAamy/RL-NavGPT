@@ -67,20 +67,40 @@ def _terminate_process_group(process: subprocess.Popen[Any]) -> int:
         return process.wait(timeout=30)
 
 
-def _preflight_cuda(gpus: Sequence[str]) -> None:
+def _preflight_cuda(gpus: Sequence[str], *, min_free_gib: float) -> None:
     import torch
 
-    require(len(gpus) == 4, "Closed-loop validation requires exactly four GPUs")
+    require(min_free_gib > 0, "--min-free-gib must be positive")
+    require(
+        len(gpus) in {2, 4},
+        "Closed-loop validation requires exactly two or four GPUs",
+    )
     require(torch.cuda.is_available(), "CUDA is unavailable; restart the container")
     require(
-        torch.cuda.device_count() >= 4,
-        f"Expected four visible GPUs, got {torch.cuda.device_count()}",
+        torch.cuda.device_count() >= len(gpus),
+        f"Too few visible GPUs: requested={len(gpus)}, "
+        f"visible={torch.cuda.device_count()}",
     )
     requested = [int(value) for value in gpus]
     require(
-        len(set(requested)) == 4 and min(requested) >= 0,
+        len(set(requested)) == len(gpus)
+        and min(requested) >= 0
+        and max(requested) < torch.cuda.device_count(),
         f"Invalid GPU list: {requested}",
     )
+    minimum_bytes = int(min_free_gib * 1024**3)
+    for device in requested:
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        print(
+            f"GPU {device}: free={free_bytes / 1024**3:.2f} GiB "
+            f"total={total_bytes / 1024**3:.2f} GiB",
+            flush=True,
+        )
+        require(
+            free_bytes >= minimum_bytes,
+            f"GPU {device} has only {free_bytes / 1024**3:.2f} GiB free; "
+            f"closed-loop validation requires at least {min_free_gib:.2f} GiB",
+        )
 
 
 def _prepare_fixture(args: argparse.Namespace, root: Path) -> dict[str, Any]:
@@ -293,6 +313,7 @@ def _assert_final_state(
     *,
     root: Path,
     output: Path,
+    world_size: int,
     interrupted: Mapping[str, Any],
     checkpoint_one_sha256: str,
 ) -> dict[str, Any]:
@@ -392,7 +413,7 @@ def _assert_final_state(
     report = {
         "schema_version": 1,
         "status": "PASS",
-        "world_size": 4,
+        "world_size": world_size,
         "interruption": dict(interrupted),
         "fast_steps": fast_steps,
         "evaluation_event_count": len(queue["events"]),
@@ -448,6 +469,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-navigation-steps", type=int, default=1)
     parser.add_argument("--max-tool-calling-iterations", type=int, default=1)
     parser.add_argument("--interrupt-timeout-seconds", type=int, default=900)
+    parser.add_argument("--min-free-gib", type=float, default=50.0)
     parser.add_argument("--seed", type=int, default=0)
     return parser
 
@@ -455,7 +477,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     gpu_ids = [value.strip() for value in args.gpus.split(",") if value.strip()]
-    _preflight_cuda(gpu_ids)
+    _preflight_cuda(gpu_ids, min_free_gib=args.min_free_gib)
     require(
         0 < args.fast_subset_size <= args.fixture_size,
         "fast subset must fit inside the validation fixture",
@@ -524,10 +546,13 @@ def main() -> None:
         args,
         root=root,
         output=output,
+        world_size=len(gpu_ids),
         interrupted=interrupted,
         checkpoint_one_sha256=checkpoint_one_sha256,
     )
-    print("PASS real four-GPU train/evaluate/resume validation")
+    print(
+        f"PASS real {len(gpu_ids)}-GPU train/evaluate/resume validation"
+    )
     print("- training was interrupted with fast-step-1 persisted in the queue")
     print("- evaluation-only drained the queue without an optimizer step")
     print("- checkpoint-1 resumed through step 2 and epoch-end full selection")
