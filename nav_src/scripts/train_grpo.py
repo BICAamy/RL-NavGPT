@@ -55,6 +55,13 @@ def main() -> None:
 
 
 def _run(args: argparse.Namespace, distributed: DistributedContext) -> None:
+    if args.validation_only and (
+        not args.validation or args.resume_from_checkpoint is None
+    ):
+        raise ValueError(
+            "--validation-only requires --validation and "
+            "--resume-from-checkpoint checkpoint-N"
+        )
     steps_per_generation, gradient_accumulation_steps = (
         resolve_parallel_batch_settings(
             num_generations=args.num_generations,
@@ -174,6 +181,28 @@ def _run(args: argparse.Namespace, distributed: DistributedContext) -> None:
             run_fingerprint=run_manifest["run_fingerprint"],
             distributed_context=distributed,
         )
+    if args.validation_only:
+        if checkpoint is None or validation_manager is None:
+            raise RuntimeError("Validation-only preflight was bypassed")
+        resumed_events = validation_manager.resume_pending(
+            current_step=int(Path(checkpoint).name.removeprefix("checkpoint-"))
+        )
+        if resumed_events == 0:
+            raise ValueError("--validation-only found no queued evaluation event")
+        distributed.barrier()
+        if distributed.is_main_process:
+            print(
+                json.dumps(
+                    {
+                        "mode": "validation_only",
+                        "checkpoint": str(checkpoint),
+                        "completed_events": resumed_events,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        return
     result = run_grpo_training(
         bundle,
         run_manifest=run_manifest,
@@ -325,6 +354,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(repo_root / "outputs/grpo-stage6-first-run"),
     )
     parser.add_argument("--resume-from-checkpoint")
+    parser.add_argument(
+        "--validation-only",
+        action="store_true",
+        help=(
+            "load a resume checkpoint, drain queued validation, and exit "
+            "without running another optimizer step"
+        ),
+    )
     parser.add_argument(
         "--distributed-mode",
         choices=("auto", "single", "ddp"),

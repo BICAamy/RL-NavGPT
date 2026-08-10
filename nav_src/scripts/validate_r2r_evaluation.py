@@ -242,6 +242,32 @@ def main() -> None:
             selected["full_best"]["adapter_path"] == snapshot.path,
             "Best selector did not retain the immutable snapshot",
         )
+        weaker_full = {
+            **full_job,
+            "job_id": "full-step-2000",
+            "step": 2_000,
+            "snapshot": {
+                **full_job["snapshot"],
+                "step": 2_000,
+                "path": str(root / "weaker-step-2000"),
+                "fingerprint": "weaker",
+            },
+            "result": {
+                "count": 6,
+                "metrics": {"spl": 49, "sr": 99, "nDTW": 99, "nav_error": 0},
+            },
+        }
+        selected = selector.record_epoch(
+            event_id="epoch-2",
+            step=2_000,
+            epoch=2.0,
+            candidates=[completed_candidate(weaker_full, roles=("epoch_end",))],
+        )
+        require(
+            selected["full_best"]["snapshot_fingerprint"]
+            == snapshot.fingerprint,
+            "A weaker second epoch replaced historical full-best",
+        )
         queue.update_event(event["event_id"], status="completed")
         require(not queue.pending_events(), "Completed event remained queued")
 
@@ -270,12 +296,42 @@ def main() -> None:
             "Fast or epoch validation was not scheduled",
         )
 
+        manager = FakeManager()
+        callback = make_grpo_validation_callback(
+            manager,
+            transformers_module=SimpleNamespace(TrainerCallback=object),
+        )
+        for step, epoch, fast_due in (
+            (1_000, 0.1, True),
+            (14_039, 1.0, False),
+            (15_000, 1.1, True),
+            (28_078, 2.0, False),
+        ):
+            state = SimpleNamespace(global_step=step, epoch=epoch)
+            control = SimpleNamespace(should_save=False)
+            if fast_due:
+                callback.on_step_end(args, state, control)
+            else:
+                callback.on_epoch_end(args, state, control)
+            require(control.should_save, f"Step {step} did not request a checkpoint")
+            callback.on_save(args, state, control)
+        require(
+            [row["step"] for row in manager.calls]
+            == [1_000, 14_039, 15_000, 28_078],
+            "Two-epoch validation schedule changed",
+        )
+        require(
+            [row["epoch_due"] for row in manager.calls]
+            == [False, True, False, True],
+            "Two-epoch full evaluation schedule changed",
+        )
+
     print("PASS R2R validation contract")
     print("- fixed Val-Unseen subset and standard metrics")
     print("- rank JSONL recovery and exact coverage")
     print("- immutable eval snapshot and resumable evaluation queue")
     print("- SPL-first quick/full best selector")
-    print("- 1000-step fast plus epoch-end full scheduling")
+    print("- two-epoch 1000-step fast plus epoch-end full scheduling")
 
 
 if __name__ == "__main__":

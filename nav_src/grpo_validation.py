@@ -132,7 +132,7 @@ class GRPOValidationManager:
         )
         self.distributed.call_on_main_and_broadcast(self._initialize_artifacts)
 
-    def resume_pending(self, *, current_step: int) -> None:
+    def resume_pending(self, *, current_step: int) -> int:
         pending = self.distributed.call_on_main_and_broadcast(
             lambda: list(self.queue.pending_events())
         )
@@ -142,6 +142,7 @@ class GRPOValidationManager:
                     f"Pending validation is step {event['step']}, not {current_step}"
                 )
             self._execute_event(event)
+        return len(pending)
 
     def run_scheduled_checkpoint(
         self,
