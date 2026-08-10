@@ -32,7 +32,10 @@ from grpo_runtime import (  # noqa: E402
 )
 from grpo_training import GRPOOptimizationConfig  # noqa: E402
 from lora_policy import LoRAPolicyConfig  # noqa: E402
-from scripts.launch_grpo import build_launch_command  # noqa: E402
+from scripts.launch_grpo import (  # noqa: E402
+    BLACKWELL_SAFE_NCCL_ENVIRONMENT,
+    build_launch_command,
+)
 from scripts.train_grpo import resolve_parallel_batch_settings  # noqa: E402
 
 
@@ -487,6 +490,7 @@ def validate_launcher_contract() -> None:
         argparse.Namespace(
             mode="single",
             gpus=[2],
+            nccl_profile="default",
             training_args=["--", "--max-completion-length", "32"],
         )
     )
@@ -499,6 +503,10 @@ def validate_launcher_contract() -> None:
         "Single launcher unexpectedly used torchrun",
     )
     require(
+        single_environment["NAVGPT_NCCL_PROFILE"] == "default",
+        "Single launcher did not record the default NCCL profile",
+    )
+    require(
         single_command[-4:]
         == ["--distributed-mode", "single", "--max-completion-length", "32"],
         "Single launcher forwarded the wrong training arguments",
@@ -508,6 +516,7 @@ def validate_launcher_contract() -> None:
         argparse.Namespace(
             mode="ddp",
             gpus=[0, 1, 2, 3],
+            nccl_profile="default",
             training_args=["--", "--max-completion-length", "32"],
         )
     )
@@ -525,6 +534,47 @@ def validate_launcher_contract() -> None:
         == ["--distributed-mode", "ddp", "--max-completion-length", "32"],
         "DDP launcher forwarded the wrong training arguments",
     )
+
+    safe_command, safe_environment = build_launch_command(
+        argparse.Namespace(
+            mode="ddp",
+            gpus=[0, 1, 2, 3],
+            nccl_profile="blackwell-safe",
+            training_args=["--", "--max-completion-length", "32"],
+        )
+    )
+    require(
+        safe_command == ddp_command,
+        "NCCL profile unexpectedly changed the torchrun command",
+    )
+    require(
+        safe_environment["NAVGPT_NCCL_PROFILE"] == "blackwell-safe",
+        "Blackwell-safe profile was not recorded",
+    )
+    require(
+        all(
+            safe_environment.get(name) == value
+            for name, value in BLACKWELL_SAFE_NCCL_ENVIRONMENT.items()
+        ),
+        "Blackwell-safe NCCL overrides are incomplete",
+    )
+
+    try:
+        build_launch_command(
+            argparse.Namespace(
+                mode="single",
+                gpus=[2],
+                nccl_profile="blackwell-safe",
+                training_args=["--", "--max-completion-length", "32"],
+            )
+        )
+    except ValueError as exc:
+        require(
+            "only valid in DDP mode" in str(exc),
+            "Single-GPU NCCL profile rejection was unclear",
+        )
+    else:
+        raise AssertionError("Single-GPU launcher accepted a DDP NCCL profile")
 
 
 def validate_lora_only_ddp_boundary() -> None:

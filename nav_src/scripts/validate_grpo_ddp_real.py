@@ -70,6 +70,8 @@ def _launch_command(
         "ddp",
         "--gpus",
         args.gpus,
+        "--nccl-profile",
+        args.nccl_profile,
         "--",
         "--output-dir",
         str(output_dir),
@@ -333,6 +335,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--validation-root", required=True)
     parser.add_argument("--gpus", default="0,1,2,3")
+    parser.add_argument(
+        "--nccl-profile",
+        choices=("default", "blackwell-safe"),
+        default="default",
+        help="NCCL profile forwarded to scripts/launch_grpo.py",
+    )
     parser.add_argument("--max-completion-length", type=int, required=True)
     parser.add_argument("--max-navigation-steps", type=int, default=1)
     parser.add_argument("--max-tool-calling-iterations", type=int, default=1)
@@ -383,6 +391,7 @@ def main() -> None:
         "schema_version": 1,
         "status": "PASS",
         "mode": "ddp",
+        "nccl_profile": args.nccl_profile,
         "world_size": len(gpu_ids),
         "num_generations": args.num_generations,
         "continuous_checkpoint": str(continuous / "checkpoint-2"),
