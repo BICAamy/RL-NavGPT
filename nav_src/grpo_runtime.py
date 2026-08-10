@@ -729,11 +729,31 @@ def run_grpo_training(
     if transformers_module is None:
         import transformers as transformers_module
     distributed_context = bundle.metrics_recorder.distributed_context
-    from distributed_runtime import configure_trainable_only_ddp
+    from distributed_runtime import (
+        configure_trainable_only_ddp,
+        disable_redundant_ddp_initial_sync,
+    )
 
     ddp_boundary = configure_trainable_only_ddp(
         bundle.policy.model,
         distributed_context,
+    )
+    initial_parameter_sha256 = None
+    if distributed_context.is_distributed:
+        # DDP init_sync normally broadcasts all trainable parameters in a fixed
+        # 250-MiB bucket.  This server's NCCL SHM transport fails on that bucket,
+        # so prove exact LoRA equality first and then omit only the redundant
+        # initialization broadcast.  Backward gradient AllReduce is unchanged.
+        initial_parameter_sha256 = _audit_trainable_parameter_sync(
+            bundle.policy,
+            distributed_context,
+        )
+        ddp_boundary["init_sync"] = not disable_redundant_ddp_initial_sync(
+            bundle.trainer.accelerator,
+            distributed_context,
+        )
+    ddp_boundary["initial_trainable_parameter_sha256"] = (
+        initial_parameter_sha256
     )
     # Preserve the audited boundary for validation/debugging without changing
     # Transformers' checkpoint schema.
@@ -744,7 +764,9 @@ def run_grpo_training(
             f"trainable_tensors={ddp_boundary['trainable_parameter_count']} "
             f"ignored_frozen_tensors="
             f"{ddp_boundary['ignored_frozen_parameter_count']} "
-            f"ignored_buffers={ddp_boundary['ignored_buffer_count']}",
+            f"ignored_buffers={ddp_boundary['ignored_buffer_count']} "
+            f"init_sync={ddp_boundary['init_sync']} "
+            f"initial_sha256={initial_parameter_sha256}",
             flush=True,
         )
     checkpoint_callback = make_grpo_checkpoint_callback(

@@ -10,6 +10,7 @@ initializing ``torch.distributed``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 import os
 from typing import Any, Callable, List, Optional
 
@@ -20,6 +21,79 @@ class DistributedConfigurationError(RuntimeError):
 
 class DistributedOperationError(RuntimeError):
     """Raised on worker ranks when a rank-zero operation fails."""
+
+
+class _DDPHandlerWithoutInitialSync:
+    """Accelerate DDP-handler proxy adding PyTorch's ``init_sync=False``."""
+
+    def __init__(self, delegate: Any) -> None:
+        self._delegate = delegate
+
+    def to_kwargs(self) -> dict[str, Any]:
+        kwargs = dict(self._delegate.to_kwargs())
+        existing = kwargs.get("init_sync")
+        if existing not in (None, False):
+            raise DistributedConfigurationError(
+                "Accelerate already requested DDP init_sync=True"
+            )
+        kwargs["init_sync"] = False
+        return kwargs
+
+    def register_comm_hook(self, model: Any) -> Any:
+        return self._delegate.register_comm_hook(model)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+
+def disable_redundant_ddp_initial_sync(
+    accelerator: Any,
+    distributed_context: "DistributedContext",
+) -> bool:
+    """Skip DDP's initial parameter broadcast after an external audit.
+
+    Accelerate 1.14.0 does not expose PyTorch 2.7.1's public ``init_sync``
+    argument in ``DistributedDataParallelKwargs``.  Install a narrow handler
+    proxy so ``Accelerator.prepare_model`` forwards ``init_sync=False`` while
+    preserving every other Transformers/Accelerate DDP option and all gradient
+    synchronization hooks.
+
+    The caller must first prove that trainable parameters are byte-identical on
+    every rank.  Frozen parameters are bound to the immutable model fingerprint
+    in the run manifest and are excluded by ``configure_trainable_only_ddp``.
+    """
+
+    if not distributed_context.is_distributed:
+        return False
+    if distributed_context.mode != "ddp":
+        raise DistributedConfigurationError(
+            "world_size>1 requires DDP before disabling initial synchronization"
+        )
+    torch_module = distributed_context._torch
+    if torch_module is None:
+        raise DistributedConfigurationError(
+            "DDP initial-sync configuration requires the initialized PyTorch runtime"
+        )
+    ddp_class = torch_module.nn.parallel.DistributedDataParallel
+    if "init_sync" not in inspect.signature(ddp_class).parameters:
+        raise DistributedConfigurationError(
+            "Pinned PyTorch DDP does not expose the required init_sync argument"
+        )
+    handler = getattr(accelerator, "ddp_handler", None)
+    if handler is None:
+        raise DistributedConfigurationError(
+            "Accelerate did not create a DDP kwargs handler"
+        )
+    if isinstance(handler, _DDPHandlerWithoutInitialSync):
+        return True
+    proxy = _DDPHandlerWithoutInitialSync(handler)
+    resolved = proxy.to_kwargs()
+    if resolved.get("init_sync") is not False:
+        raise DistributedConfigurationError(
+            "DDP handler did not retain init_sync=False"
+        )
+    accelerator.ddp_handler = proxy
+    return True
 
 
 def configure_trainable_only_ddp(
@@ -68,6 +142,7 @@ def configure_trainable_only_ddp(
 
     report = {
         "applied": False,
+        "init_sync": True,
         "trainable_parameter_count": len(trainable),
         "trainable_parameter_elements": sum(
             int(parameter.numel()) for _, parameter in trainable

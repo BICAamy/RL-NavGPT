@@ -5,10 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from types import SimpleNamespace
 import sys
 import tempfile
+from types import SimpleNamespace
 from typing import Any, Mapping
+import warnings
 
 
 NAV_SRC_DIR = Path(__file__).resolve().parents[1]
@@ -19,6 +20,7 @@ from action_plan_cache import canonical_json, sha256_text  # noqa: E402
 from distributed_runtime import (  # noqa: E402
     DistributedContext,
     configure_trainable_only_ddp,
+    disable_redundant_ddp_initial_sync,
     single_process_context,
 )
 from grpo_runtime import (  # noqa: E402
@@ -192,17 +194,48 @@ def _worker(
     ddp_policy = TinyDDPPolicy()
     with torch.no_grad():
         ddp_policy.backbone.weight.fill_(float(rank + 1))
-        ddp_policy.lora.weight.fill_(float(rank + 1))
+        # This is the invariant checked before disabling DDP init_sync: every
+        # rank starts from byte-identical trainable LoRA tensors.
+        ddp_policy.lora.weight.fill_(1.0)
         ddp_policy.fixed_scale.fill_(float(rank + 1))
     boundary = configure_trainable_only_ddp(ddp_policy, context)
     require(boundary["applied"] is True,
             "Real Gloo DDP boundary was not installed")
-    wrapped_policy = torch.nn.parallel.DistributedDataParallel(ddp_policy)
-    # DDP must synchronize the trainable LoRA tensor from rank zero while
-    # leaving the locally loaded frozen state outside all DDP collectives.
+    initial_sha256 = _audit_trainable_parameter_sync(
+        SimpleNamespace(model=ddp_policy),
+        context,
+    )
+
+    class FakeDDPHandler:
+        def to_kwargs(self) -> dict[str, Any]:
+            return {"broadcast_buffers": False}
+
+        def register_comm_hook(self, model: Any) -> None:
+            del model
+
+    accelerator = SimpleNamespace(ddp_handler=FakeDDPHandler())
+    require(
+        disable_redundant_ddp_initial_sync(accelerator, context),
+        "DDP init_sync was not disabled after the LoRA audit",
+    )
+    ddp_kwargs = accelerator.ddp_handler.to_kwargs()
+    require(ddp_kwargs["init_sync"] is False,
+            "Accelerate DDP handler retained initial synchronization")
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="`broadcast_buffers` is deprecated.*",
+            category=FutureWarning,
+        )
+        wrapped_policy = torch.nn.parallel.DistributedDataParallel(
+            ddp_policy,
+            **ddp_kwargs,
+        )
+    # DDP must retain the audited trainable LoRA tensor and leave locally
+    # loaded frozen state outside all initialization collectives.
     require(
         float(ddp_policy.lora.weight[0, 0].detach()) == 1.0,
-        "DDP did not synchronize the trainable LoRA tensor",
+        "DDP changed the audited trainable LoRA tensor",
     )
     require(
         float(ddp_policy.backbone.weight[0, 0]) == float(rank + 1),
@@ -217,6 +250,8 @@ def _worker(
         ddp_policy.lora.weight.grad is not None,
         "DDP did not retain LoRA gradient reduction hooks",
     )
+    require(len(initial_sha256) == 64,
+            "Initial LoRA synchronization audit returned a bad digest")
     context.barrier()
 
     root = Path(root_value)
@@ -541,6 +576,28 @@ def validate_lora_only_ddp_boundary() -> None:
     repeated = configure_trainable_only_ddp(model, context)
     require(repeated == report, "DDP boundary installation is not idempotent")
 
+    class FakeDDPHandler:
+        def to_kwargs(self) -> dict[str, Any]:
+            return {"find_unused_parameters": False}
+
+        def register_comm_hook(self, model: Any) -> None:
+            del model
+
+    accelerator = SimpleNamespace(ddp_handler=FakeDDPHandler())
+    require(
+        disable_redundant_ddp_initial_sync(accelerator, context),
+        "DDP init_sync proxy was not installed",
+    )
+    require(
+        accelerator.ddp_handler.to_kwargs()
+        == {"find_unused_parameters": False, "init_sync": False},
+        "DDP init_sync proxy changed unrelated Accelerate options",
+    )
+    require(
+        disable_redundant_ddp_initial_sync(accelerator, context),
+        "DDP init_sync proxy is not idempotent",
+    )
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -569,7 +626,8 @@ def main() -> None:
     print("- launcher and 1/2/4-GPU batches preserve one complete GRPO group")
     print("- two real Gloo ranks produced one ordered, rank-zero-owned rollout log")
     print("- DDP checkpoints require all-rank RNG and synchronized LoRA tensors")
-    print("- DDP initialization ignores frozen Qwen state but keeps LoRA trainable")
+    print("- audited identical LoRA state skips redundant DDP initialization sync")
+    print("- frozen Qwen state is ignored while LoRA gradient reduction remains active")
 
 
 if __name__ == "__main__":
