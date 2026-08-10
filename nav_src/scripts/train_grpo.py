@@ -32,6 +32,12 @@ from grpo_training import (  # noqa: E402
     load_policy_and_build_grpo_trainer,
 )
 from lora_policy import LoRAPolicyConfig  # noqa: E402
+from grpo_validation import (  # noqa: E402
+    GRPOValidationConfig,
+    GRPOValidationManager,
+    prepare_validation_contract,
+)
+from r2r_evaluation import R2REvaluationConfig  # noqa: E402
 
 
 def main() -> None:
@@ -114,15 +120,33 @@ def _run(args: argparse.Namespace, distributed: DistributedContext) -> None:
         device_map=("distributed" if distributed.is_distributed else "single"),
         max_trainable_percentage=args.max_trainable_percentage,
     )
+    validation_config = build_validation_config(args)
 
     runtime_contract = audit_trl_runtime_contract()
     components = load_grpo_training_components(component_config)
+    validation_contract = distributed.call_on_main_and_broadcast(
+        lambda: prepare_validation_contract(validation_config)
+    )
+    if bool(validation_contract.get("enabled")):
+        train_planner_fingerprints = {
+            str(record.get("planner_fingerprint", ""))
+            for record in components.instr_data
+        }
+        validation_planner_fingerprint = str(
+            validation_contract["evaluation"]["planner_fingerprint"]
+        )
+        if train_planner_fingerprints != {validation_planner_fingerprint}:
+            raise ValueError(
+                "Train and Val-Unseen action plans use different frozen "
+                "Planner identities"
+            )
     run_manifest = distributed.call_on_main_and_broadcast(
         lambda: build_grpo_run_manifest(
             policy_config=policy_config,
             components=components,
             optimization=optimization,
             runtime_contract=runtime_contract,
+            validation_contract=validation_contract,
         )
     )
     checkpoint = prepare_grpo_run(
@@ -140,15 +164,54 @@ def _run(args: argparse.Namespace, distributed: DistributedContext) -> None:
         adapter_path=None if checkpoint is None else str(checkpoint),
         distributed_context=distributed,
     )
+    validation_manager = None
+    if validation_config is not None:
+        validation_manager = GRPOValidationManager(
+            policy=bundle.policy,
+            config=validation_config,
+            contract=validation_contract,
+            output_dir=args.output_dir,
+            run_fingerprint=run_manifest["run_fingerprint"],
+            distributed_context=distributed,
+        )
     result = run_grpo_training(
         bundle,
         run_manifest=run_manifest,
         resume_from_checkpoint=(
             None if checkpoint is None else str(checkpoint)
         ),
+        validation_manager=validation_manager,
     )
     if distributed.is_main_process:
         print(json.dumps(result.as_dict(), indent=2, sort_keys=True))
+
+
+def build_validation_config(
+    args: argparse.Namespace,
+) -> GRPOValidationConfig | None:
+    if not args.validation:
+        return None
+    return GRPOValidationConfig(
+        evaluation=R2REvaluationConfig(
+            annotation=args.validation_annotation,
+            action_plan_cache=args.validation_action_plan_cache,
+            observation_list_dir=args.observation_list_dir,
+            observation_summary_dir=args.observation_summary_dir,
+            object_list_dir=args.object_list_dir,
+            connectivity_dir=args.connectivity_dir,
+            navigable_dir=args.navigable_dir,
+            expected_instruction_count=args.validation_expected_instruction_count,
+            max_navigation_steps=args.max_navigation_steps,
+            max_tool_calling_iterations=args.max_tool_calling_iterations,
+            max_new_tokens=args.validation_max_new_tokens,
+            seed=args.validation_seed,
+        ),
+        fast_subset_manifest=args.validation_fast_subset_manifest,
+        fast_subset_size=args.validation_fast_subset_size,
+        fast_subset_seed=args.validation_seed,
+        fast_interval_steps=args.validation_fast_interval_steps,
+        progress_interval=args.validation_progress_interval,
+    )
 
 
 def resolve_parallel_batch_settings(
@@ -317,6 +380,51 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-total-limit", type=int, default=3)
     parser.add_argument("--trajectory-log-interval", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--validation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "enable resumable Val-Unseen-128 every N steps and full "
+            "Val-Unseen selection at every epoch end"
+        ),
+    )
+    parser.add_argument(
+        "--validation-annotation",
+        default=str(
+            repo_root / "datasets/R2R/annotations/R2R_val_unseen_instr.json"
+        ),
+    )
+    parser.add_argument(
+        "--validation-action-plan-cache",
+        default=str(
+            repo_root
+            / "datasets/R2R/action_plan_cache/qwen2.5-14b-val-unseen-t0-v1"
+            / "R2R_val_unseen_action_plans.jsonl"
+        ),
+    )
+    parser.add_argument(
+        "--validation-fast-subset-manifest",
+        default=str(
+            repo_root
+            / "datasets/R2R/eval_subsets"
+            / "R2R_val_unseen_fast128_seed0.json"
+        ),
+    )
+    parser.add_argument(
+        "--validation-expected-instruction-count",
+        type=int,
+        default=2_349,
+    )
+    parser.add_argument("--validation-fast-subset-size", type=int, default=128)
+    parser.add_argument(
+        "--validation-fast-interval-steps",
+        type=int,
+        default=1_000,
+    )
+    parser.add_argument("--validation-max-new-tokens", type=int, default=512)
+    parser.add_argument("--validation-seed", type=int, default=0)
+    parser.add_argument("--validation-progress-interval", type=int, default=10)
     parser.add_argument(
         "--full-determinism",
         action="store_true",

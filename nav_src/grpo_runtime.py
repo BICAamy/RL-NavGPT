@@ -359,6 +359,7 @@ def build_grpo_run_manifest(
     components: Any,
     optimization: Any,
     runtime_contract: Mapping[str, Any],
+    validation_contract: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build the immutable experiment identity checked on every resume."""
 
@@ -422,7 +423,9 @@ def build_grpo_run_manifest(
                 "distributed_runtime.py",
                 "grpo_runtime.py",
                 "grpo_training.py",
+                "grpo_validation.py",
                 "lora_policy.py",
+                "r2r_evaluation.py",
                 "rl_env.py",
                 "navigation_rewards.py",
                 "navigation_state.py",
@@ -460,6 +463,13 @@ def build_grpo_run_manifest(
             ),
             "component_config": component_values,
         },
+        "validation": dict(
+            validation_contract
+            or {
+                "schema_version": 1,
+                "enabled": False,
+            }
+        ),
         "sources": sources,
     }
     body["run_fingerprint"] = sha256_text(canonical_json(body))
@@ -723,6 +733,7 @@ def run_grpo_training(
     run_manifest: Mapping[str, Any],
     resume_from_checkpoint: Optional[str],
     transformers_module: Optional[Any] = None,
+    validation_manager: Optional[Any] = None,
 ) -> GRPOTrainingResult:
     """Run standard TRL training, then save one verified final LoRA adapter."""
 
@@ -777,6 +788,26 @@ def run_grpo_training(
         distributed_context=distributed_context,
     )
     bundle.trainer.add_callback(checkpoint_callback)
+    if validation_manager is not None:
+        from grpo_validation import make_grpo_validation_callback
+
+        validation_callback = make_grpo_validation_callback(
+            validation_manager,
+            transformers_module=transformers_module,
+        )
+        bundle.trainer.add_callback(validation_callback)
+        resume_step = 0
+        if resume_from_checkpoint is not None:
+            match = re.fullmatch(
+                r"checkpoint-(\d+)",
+                Path(resume_from_checkpoint).name,
+            )
+            if match is None:
+                raise GRPORuntimeError(
+                    "Validation resume requires a standard checkpoint-N path"
+                )
+            resume_step = int(match.group(1))
+        validation_manager.resume_pending(current_step=resume_step)
     bundle.metrics_recorder.start_session(resume_from_checkpoint)
     train_result = bundle.trainer.train(
         resume_from_checkpoint=resume_from_checkpoint
