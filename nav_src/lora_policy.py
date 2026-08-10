@@ -1,9 +1,10 @@
-"""Strict PEFT LoRA construction for the trainable NavGPT policy.
+"""Strict PEFT LoRA construction and frozen inference for NavGPT.
 
-This module deliberately keeps model loading separate from the zero-shot HF
-wrapper in :mod:`LLMs.hf_chat`.  The Planner remains frozen in its dedicated
-Transformers 4.48 environment, while this module builds the policy that will
-later be handed to TRL's GRPO trainer.
+The training path builds the policy handed to TRL's GRPO trainer.  The
+inference path loads either the same frozen base model or a provenance-checked
+LoRA adapter and proves that no parameter remains trainable.  The zero-shot HF
+wrapper in :mod:`LLMs.hf_chat` uses that inference path so base and adapter
+evaluation obey one loading contract.
 
 Heavy dependencies are imported lazily so the configuration and validation
 contract can be tested without loading Qwen2.5-14B or requiring a GPU.
@@ -160,6 +161,30 @@ class TrainableParameterReport:
 
 
 @dataclass(frozen=True)
+class FrozenParameterReport:
+    """Exact audit proving that an evaluation model is fully frozen."""
+
+    total_parameters: int
+    frozen_parameters: int
+    parameter_tensor_count: int
+    adapter_parameters: int
+    adapter_tensor_count: int
+    trainable_parameters: int = 0
+    trainable_tensor_count: int = 0
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "total_parameters": self.total_parameters,
+            "frozen_parameters": self.frozen_parameters,
+            "parameter_tensor_count": self.parameter_tensor_count,
+            "adapter_parameters": self.adapter_parameters,
+            "adapter_tensor_count": self.adapter_tensor_count,
+            "trainable_parameters": self.trainable_parameters,
+            "trainable_tensor_count": self.trainable_tensor_count,
+        }
+
+
+@dataclass(frozen=True)
 class LoRAPolicyBundle:
     """Tokenizer, PEFT model, and their validation reports."""
 
@@ -197,6 +222,48 @@ class LoRAPolicyBundle:
 
 
 @dataclass(frozen=True)
+class FrozenPolicyBundle:
+    """Tokenizer and fully frozen base/LoRA model used for evaluation."""
+
+    model: Any
+    tokenizer: Any
+    config: LoRAPolicyConfig
+    parameter_report: FrozenParameterReport
+    target_report: Optional[TargetModuleReport] = None
+    adapter_path: Optional[str] = None
+
+    def summary(self) -> Dict[str, Any]:
+        model_config = getattr(self.model, "config", None)
+        return {
+            "model_path": str(Path(self.config.model_path).expanduser()),
+            "model_class": type(self.model).__name__,
+            "tokenizer_class": type(self.tokenizer).__name__,
+            "model_type": getattr(model_config, "model_type", None),
+            "dtype": self.config.dtype,
+            "device_map": self.config.device_map,
+            "mode": "frozen_inference",
+            "adapter_source": "base" if self.adapter_path is None else "local",
+            "adapter_path": self.adapter_path,
+            "lora": (
+                None
+                if self.target_report is None
+                else {
+                    "r": self.config.r,
+                    "lora_alpha": self.config.lora_alpha,
+                    "lora_dropout": self.config.lora_dropout,
+                    "target_modules": list(self.config.target_modules),
+                }
+            ),
+            "targets": (
+                None
+                if self.target_report is None
+                else self.target_report.as_dict()
+            ),
+            "parameters": self.parameter_report.as_dict(),
+        }
+
+
+@dataclass(frozen=True)
 class AdapterCheckpointReport:
     """Verified files written by :func:`save_lora_adapter`."""
 
@@ -226,6 +293,18 @@ class PolicyModelLoader:
 
     def load(self, *, adapter_path: Optional[str] = None) -> LoRAPolicyBundle:
         return load_policy_model(self.config, adapter_path=adapter_path)
+
+    def load_for_inference(
+        self,
+        *,
+        adapter_path: Optional[str] = None,
+    ) -> FrozenPolicyBundle:
+        """Load a zero-shot base or saved LoRA as a fully frozen policy."""
+
+        return load_frozen_policy_model(
+            self.config,
+            adapter_path=adapter_path,
+        )
 
 
 def validate_local_model_directory(model_path: str) -> Path:
@@ -602,6 +681,135 @@ def load_policy_model(
     )
 
 
+def policy_config_from_adapter_manifest(
+    model_path: str,
+    adapter_path: str,
+    *,
+    dtype: str = "bf16",
+    device_map: str = "single",
+    expected_model_type: str = "qwen2",
+) -> LoRAPolicyConfig:
+    """Reconstruct the immutable LoRA shape contract from a saved adapter.
+
+    Evaluation callers should not have to repeat ``r``, ``lora_alpha`` or the
+    target-module list on the command line.  Those values are checkpoint
+    identity, so they come from the NavGPT provenance manifest and are then
+    checked against both ``adapter_config.json`` and the supplied base model.
+    """
+
+    path = Path(adapter_path).expanduser().resolve()
+    manifest_path = path / ADAPTER_MANIFEST_NAME
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Missing NavGPT adapter provenance manifest: {manifest_path}"
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LoRAPolicyError(
+            f"Invalid NavGPT adapter manifest {manifest_path}: {exc}"
+        ) from exc
+    if manifest.get("schema_version") != ADAPTER_MANIFEST_SCHEMA_VERSION:
+        raise LoRAPolicyError(
+            f"Unsupported adapter manifest schema in {manifest_path}"
+        )
+    if manifest.get("checkpoint_type") != "navgpt_lora_adapter":
+        raise LoRAPolicyError(f"Wrong checkpoint type in {manifest_path}")
+    lora = manifest.get("lora")
+    if not isinstance(lora, Mapping):
+        raise LoRAPolicyError(f"Adapter manifest has no LoRA contract: {manifest_path}")
+    try:
+        target_modules = tuple(lora["target_modules"])
+        config = LoRAPolicyConfig(
+            model_path=model_path,
+            r=lora["r"],
+            lora_alpha=lora["lora_alpha"],
+            lora_dropout=lora["lora_dropout"],
+            target_modules=target_modules,
+            dtype=dtype,
+            device_map=device_map,
+            expected_model_type=expected_model_type,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise LoRAPolicyError(
+            f"Invalid LoRA contract in {manifest_path}: {exc}"
+        ) from exc
+    validate_local_adapter_directory(str(path), config)
+    return config
+
+
+def load_frozen_policy_model(
+    config: LoRAPolicyConfig,
+    *,
+    adapter_path: Optional[str] = None,
+    peft_api: Optional[Any] = None,
+) -> FrozenPolicyBundle:
+    """Load a base or local LoRA policy under the evaluation-only contract.
+
+    The base checkpoint is always loaded locally and validated as Qwen.  When
+    an adapter is supplied, its config, weights, base-model fingerprint and
+    target coverage must all match.  Finally every parameter is frozen, the
+    model enters ``eval`` mode, and KV caching is enabled for generation.
+    """
+
+    model, tokenizer = load_base_policy_model_and_tokenizer(config)
+    target_report: Optional[TargetModuleReport] = None
+    resolved_adapter_path: Optional[str] = None
+    if adapter_path is not None:
+        target_report = validate_target_modules(
+            model,
+            config.target_modules,
+            rank=config.r,
+        )
+        resolved_path = validate_local_adapter_directory(adapter_path, config)
+        if peft_api is None:
+            try:
+                import peft as peft_api
+            except ImportError as exc:
+                raise LoRAPolicyError(
+                    "Loading LoRA inference requires peft from "
+                    "requirements-train.txt"
+                ) from exc
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        model = peft_api.PeftModel.from_pretrained(
+            model,
+            str(resolved_path),
+            is_trainable=False,
+            local_files_only=True,
+        )
+        _validate_peft_configuration(
+            model,
+            config,
+            expected_inference_mode=True,
+        )
+        _validate_peft_target_coverage(model, target_report)
+        resolved_adapter_path = str(resolved_path)
+
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    model.eval()
+    if bool(getattr(model, "training", True)):
+        raise LoRAParameterValidationError(
+            "Frozen inference policy did not enter eval mode"
+        )
+    model_config = getattr(model, "config", None)
+    if hasattr(model_config, "use_cache"):
+        model_config.use_cache = True
+    parameter_report = audit_frozen_parameters(
+        model,
+        target_report=target_report,
+    )
+    return FrozenPolicyBundle(
+        model=model,
+        tokenizer=tokenizer,
+        config=config,
+        parameter_report=parameter_report,
+        target_report=target_report,
+        adapter_path=resolved_adapter_path,
+    )
+
+
 def build_lora_policy(config: LoRAPolicyConfig) -> LoRAPolicyBundle:
     """Backward-compatible name for initializing a fresh policy adapter."""
 
@@ -912,6 +1120,68 @@ def audit_trainable_parameters(
     )
 
 
+def audit_frozen_parameters(
+    model: Any,
+    *,
+    target_report: Optional[TargetModuleReport] = None,
+) -> FrozenParameterReport:
+    """Prove that inference cannot update the base model or an adapter."""
+
+    named_parameters = list(model.named_parameters())
+    if not named_parameters:
+        raise LoRAParameterValidationError("Model exposes no parameters")
+    trainable_names = [
+        name
+        for name, parameter in named_parameters
+        if bool(parameter.requires_grad)
+    ]
+    if trainable_names:
+        raise LoRAParameterValidationError(
+            "Inference policy still has trainable tensors: "
+            + ", ".join(trainable_names[:20])
+        )
+    total_parameters = sum(
+        int(parameter.numel()) for _, parameter in named_parameters
+    )
+    if total_parameters <= 0:
+        raise LoRAParameterValidationError(
+            "Model reported an invalid total parameter count"
+        )
+    adapter = [
+        (name, parameter)
+        for name, parameter in named_parameters
+        if _is_lora_ab_name(name)
+    ]
+    adapter_parameters = sum(
+        int(parameter.numel()) for _, parameter in adapter
+    )
+    if target_report is None:
+        if adapter:
+            raise LoRAParameterValidationError(
+                "Base-only inference unexpectedly contains LoRA tensors"
+            )
+    else:
+        expected_tensor_count = 2 * target_report.matched_module_count
+        if len(adapter) != expected_tensor_count:
+            raise LoRAParameterValidationError(
+                "Frozen adapter tensor count differs from target coverage: "
+                f"expected {expected_tensor_count}, got {len(adapter)}"
+            )
+        if adapter_parameters != target_report.expected_lora_parameters:
+            raise LoRAParameterValidationError(
+                "Frozen adapter parameter count differs from target shapes: "
+                f"expected {target_report.expected_lora_parameters}, got "
+                f"{adapter_parameters}"
+            )
+    return FrozenParameterReport(
+        total_parameters=total_parameters,
+        frozen_parameters=total_parameters,
+        parameter_tensor_count=len(named_parameters),
+        adapter_parameters=adapter_parameters,
+        adapter_tensor_count=len(adapter),
+    )
+
+
 def _validate_peft_target_coverage(
     peft_model: Any,
     target_report: TargetModuleReport,
@@ -938,6 +1208,8 @@ def _validate_peft_target_coverage(
 def _validate_peft_configuration(
     peft_model: Any,
     requested: LoRAPolicyConfig,
+    *,
+    expected_inference_mode: bool = False,
 ) -> None:
     configurations = getattr(peft_model, "peft_config", None)
     if not isinstance(configurations, Mapping) or len(configurations) != 1:
@@ -956,7 +1228,10 @@ def _validate_peft_configuration(
             requested.lora_dropout,
         ),
         "bias": (getattr(actual, "bias", None), "none"),
-        "inference_mode": (getattr(actual, "inference_mode", None), False),
+        "inference_mode": (
+            getattr(actual, "inference_mode", None),
+            expected_inference_mode,
+        ),
         "init_lora_weights": (
             getattr(actual, "init_lora_weights", None),
             True,

@@ -23,6 +23,15 @@ def parse_args(argv=None):
         help='HF model directory or GGUF model file path',
     )
     parser.add_argument(
+        '--local_adapter_path',
+        type=str,
+        default='',
+        help=(
+            'optional local NavGPT LoRA adapter directory for the HF backend; '
+            'the adapter provenance manifest must match --local_model_path'
+        ),
+    )
+    parser.add_argument(
         '--local_chat_template',
         type=str,
         default='qwen',
@@ -158,6 +167,20 @@ def parse_args(argv=None):
 
 
 def postprocess_args(args):
+    if args.local_adapter_path:
+        if args.llm_backend != 'hf':
+            raise ValueError(
+                '--local_adapter_path is valid only with --llm_backend hf'
+            )
+        if not args.local_model_path:
+            raise ValueError(
+                '--local_model_path is required with --local_adapter_path'
+            )
+        if args.hf_device_map != 'single':
+            raise ValueError(
+                'LoRA inference requires --hf_device_map single'
+            )
+
     ROOTDIR = args.root_dir
 
     # Setup input paths

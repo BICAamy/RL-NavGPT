@@ -227,6 +227,9 @@ class NavAgent(BaseAgent):
         dtype = torch.bfloat16 if self.config.local_dtype == "bf16" else torch.float16
         return HuggingFaceChatLLM.from_model_path(
             model_path=self.config.local_model_path,
+            adapter_path=(
+                getattr(self.config, "local_adapter_path", "") or None
+            ),
             dtype=dtype,
             device_map=self.config.hf_device_map,
             chat_template=self.config.local_chat_template,

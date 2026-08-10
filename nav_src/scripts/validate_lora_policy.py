@@ -3,7 +3,8 @@
 ``contract`` exercises the strict target/freeze/parameter-count invariants with
 synthetic modules and has no torch/transformers/peft dependency.  ``real``
 loads the local Qwen2.5-14B checkpoint on one visible GPU and applies the same
-checks to the actual model.  ``full`` additionally checks identity
+checks to the actual model.  ``inference`` loads a frozen base or saved adapter
+and runs a short generation smoke.  ``full`` additionally checks identity
 initialization, gradients, an optimizer update, safe adapter persistence, and
 the stage-six reload path.
 """
@@ -35,8 +36,10 @@ from lora_policy import (  # noqa: E402
     audit_trainable_parameters,
     build_lora_policy,
     fingerprint_local_model_weights,
+    load_frozen_policy_model,
     load_policy_model,
     load_base_policy_model_and_tokenizer,
+    policy_config_from_adapter_manifest,
     save_lora_adapter,
     validate_local_adapter_directory,
     validate_target_modules,
@@ -128,6 +131,7 @@ class FakeBaseModel:
         self._parameters = [
             ("model.embed_tokens.weight", FakeParameter(100_000_000))
         ]
+        self.training = True
 
     def named_modules(self):
         return iter(self._modules)
@@ -137,6 +141,14 @@ class FakeBaseModel:
 
     def parameters(self):
         return (parameter for _, parameter in self._parameters)
+
+    def train(self):
+        self.training = True
+        return self
+
+    def eval(self):
+        self.training = False
+        return self
 
 
 class FakeLoraConfig:
@@ -176,8 +188,15 @@ class FakePeftModel:
     def named_parameters(self):
         return iter(self._parameters)
 
+    def parameters(self):
+        return (parameter for _, parameter in self._parameters)
+
     def train(self):
         self.training = True
+        return self
+
+    def eval(self):
+        self.training = False
         return self
 
     def save_pretrained(
@@ -229,6 +248,40 @@ class FakePeftAPI:
     ) -> FakePeftModel:
         return FakePeftModel(model, config)
 
+    class PeftModel:
+        last_load = None
+
+        @staticmethod
+        def from_pretrained(
+            model: FakeBaseModel,
+            adapter_path: str,
+            *,
+            is_trainable: bool,
+            local_files_only: bool,
+        ) -> FakePeftModel:
+            FakePeftAPI.PeftModel.last_load = {
+                "adapter_path": adapter_path,
+                "is_trainable": is_trainable,
+                "local_files_only": local_files_only,
+            }
+            saved = json.loads(
+                (Path(adapter_path) / "adapter_config.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            config = FakeLoraConfig(
+                r=saved["r"],
+                lora_alpha=saved["lora_alpha"],
+                lora_dropout=saved["lora_dropout"],
+                target_modules=saved["target_modules"],
+                bias=saved["bias"],
+                inference_mode=not is_trainable,
+                init_lora_weights=True,
+                use_rslora=saved["use_rslora"],
+                use_dora=saved["use_dora"],
+            )
+            return FakePeftModel(model, config)
+
 
 class FakeTokenizer:
     def __init__(self):
@@ -272,6 +325,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="load the real local Qwen checkpoint and attach LoRA",
     )
     add_real_model_arguments(real)
+    inference = subparsers.add_parser(
+        "inference",
+        help="load a frozen base/adapter and run a short generation smoke",
+    )
+    inference.add_argument("--model-path", required=True)
+    inference.add_argument("--adapter-path")
+    inference.add_argument(
+        "--dtype",
+        choices=("bf16", "fp16"),
+        default="bf16",
+    )
+    inference.add_argument(
+        "--device-map",
+        choices=("single",),
+        default="single",
+    )
+    inference.add_argument("--max-new-tokens", type=int, default=8)
+    inference.add_argument("--seed", type=int, default=0)
     full = subparsers.add_parser(
         "full",
         help="run initialization, gradient, optimizer, save, and reload checks",
@@ -414,6 +485,7 @@ def validate_contract() -> None:
             "missing target rejected",
             "partial layer coverage rejected",
             "duplicate/missing layer cancellation rejected",
+            "base and adapter inference were fully frozen",
             "adapter checkpoint tampering rejected",
             "base-model weight tampering rejected",
             "trainable backbone rejected",
@@ -436,6 +508,10 @@ def validate_synthetic_adapter_checkpoint(
             json.dumps({"model_type": "qwen2", "num_hidden_layers": 2}),
             encoding="utf-8",
         )
+        (base_model_path / "tokenizer_config.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
         base_weights_path = base_model_path / "model.safetensors"
         base_weights = b"synthetic-base-model-weights"
         base_weights_path.write_bytes(base_weights)
@@ -454,6 +530,10 @@ def validate_synthetic_adapter_checkpoint(
             "Wrong safe adapter filename",
         )
         validate_local_adapter_directory(str(adapter_path), config)
+        validate_synthetic_frozen_inference(
+            config,
+            adapter_path,
+        )
 
         base_weights_path.write_bytes(base_weights + b"-tampered")
         try:
@@ -473,6 +553,93 @@ def validate_synthetic_adapter_checkpoint(
             pass
         else:
             raise AssertionError("A tampered adapter checkpoint was accepted")
+
+
+def validate_synthetic_frozen_inference(
+    training_config: LoRAPolicyConfig,
+    adapter_path: Path,
+) -> None:
+    """Exercise base/adapter evaluation semantics without torch or Qwen."""
+
+    fake_torch = ModuleType("torch")
+    fake_torch.bfloat16 = "synthetic-bf16"
+    fake_torch.float16 = "synthetic-fp16"
+    fake_torch.float32 = "synthetic-fp32"
+    fake_torch.cuda = SimpleNamespace(
+        is_available=lambda: True,
+        device_count=lambda: 1,
+        is_bf16_supported=lambda: True,
+    )
+    fake_transformers = ModuleType("transformers")
+    fake_transformers.AutoTokenizer = FakeTransformersLoader.AutoTokenizer
+    fake_transformers.AutoModelForCausalLM = (
+        FakeTransformersLoader.AutoModelForCausalLM
+    )
+    previous_modules = {
+        name: sys.modules.get(name) for name in ("torch", "transformers")
+    }
+    sys.modules["torch"] = fake_torch
+    sys.modules["transformers"] = fake_transformers
+    try:
+        base_bundle = load_frozen_policy_model(training_config)
+        inference_config = policy_config_from_adapter_manifest(
+            training_config.model_path,
+            str(adapter_path),
+            dtype=training_config.dtype,
+            device_map=training_config.device_map,
+        )
+        adapter_bundle = load_frozen_policy_model(
+            inference_config,
+            adapter_path=str(adapter_path),
+            peft_api=FakePeftAPI,
+        )
+    finally:
+        for name, previous in previous_modules.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+
+    require(base_bundle.adapter_path is None, "Base inference loaded an adapter")
+    require(not base_bundle.model.training, "Base inference was not in eval mode")
+    require(base_bundle.model.config.use_cache, "Base inference disabled KV cache")
+    require(
+        base_bundle.parameter_report.trainable_parameters == 0,
+        "Base inference kept trainable parameters",
+    )
+    require(
+        base_bundle.parameter_report.adapter_tensor_count == 0,
+        "Base inference unexpectedly contains adapter tensors",
+    )
+    require(
+        adapter_bundle.adapter_path == str(adapter_path.resolve()),
+        "Inference adapter path was not resolved",
+    )
+    require(
+        not adapter_bundle.model.training,
+        "Adapter inference was not in eval mode",
+    )
+    require(
+        adapter_bundle.model.config.use_cache,
+        "Adapter inference disabled KV cache",
+    )
+    require(
+        adapter_bundle.parameter_report.trainable_parameters == 0,
+        "Adapter inference kept trainable parameters",
+    )
+    require(
+        adapter_bundle.parameter_report.adapter_tensor_count
+        == 2 * adapter_bundle.target_report.matched_module_count,
+        "Frozen adapter tensor coverage is incomplete",
+    )
+    require(
+        FakePeftAPI.PeftModel.last_load["is_trainable"] is False,
+        "PEFT adapter was loaded as trainable during inference",
+    )
+    require(
+        FakePeftAPI.PeftModel.last_load["local_files_only"] is True,
+        "PEFT inference loader could access the network",
+    )
 
 
 def validate_synthetic_local_load() -> None:
@@ -560,6 +727,66 @@ def validate_real(args: argparse.Namespace) -> None:
     bundle = build_lora_policy(policy_config_from_args(args))
     print(json.dumps(bundle.summary(), indent=2, sort_keys=True))
     print("PASS stage-five real Qwen LoRA construction")
+
+
+def validate_real_inference(args: argparse.Namespace) -> None:
+    if args.max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be positive")
+    import torch
+
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    if args.adapter_path:
+        config = policy_config_from_adapter_manifest(
+            args.model_path,
+            args.adapter_path,
+            dtype=args.dtype,
+            device_map=args.device_map,
+        )
+    else:
+        config = LoRAPolicyConfig(
+            model_path=args.model_path,
+            dtype=args.dtype,
+            device_map=args.device_map,
+        )
+    bundle = load_frozen_policy_model(
+        config,
+        adapter_path=args.adapter_path,
+    )
+    rendered = bundle.tokenizer.apply_chat_template(
+        list(SMOKE_MESSAGES),
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    inputs = bundle.tokenizer(
+        rendered,
+        return_tensors="pt",
+        add_special_tokens=False,
+    )
+    inputs = move_inputs_to_model(bundle.model, inputs)
+    input_length = int(inputs["input_ids"].shape[-1])
+    with torch.inference_mode():
+        generated = bundle.model.generate(
+            **inputs,
+            max_new_tokens=args.max_new_tokens,
+            do_sample=False,
+            temperature=None,
+            top_p=None,
+            top_k=None,
+            pad_token_id=bundle.tokenizer.pad_token_id,
+            eos_token_id=bundle.tokenizer.eos_token_id,
+        )
+    generated_token_count = int(generated.shape[-1]) - input_length
+    if generated_token_count < 0:
+        raise AssertionError("Inference generation returned a truncated prompt")
+    report = bundle.summary()
+    report["generation_smoke"] = {
+        "input_tokens": input_length,
+        "generated_tokens": generated_token_count,
+        "max_new_tokens": args.max_new_tokens,
+    }
+    print(json.dumps(report, indent=2, sort_keys=True))
+    print("PASS frozen policy inference load and generation")
 
 
 def policy_config_from_args(args: argparse.Namespace) -> LoRAPolicyConfig:
@@ -945,6 +1172,8 @@ def main() -> None:
         validate_contract()
     elif args.command == "real":
         validate_real(args)
+    elif args.command == "inference":
+        validate_real_inference(args)
     else:
         validate_full(args)
 

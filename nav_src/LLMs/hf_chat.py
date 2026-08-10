@@ -63,6 +63,7 @@ class HuggingFaceChatLLM(LLM):
     model: Any
     tokenizer: Any
     model_path: str
+    adapter_path: Optional[str] = None
     chat_template: str = "auto"
     temperature: float = 0.0
     top_p: float = 0.9
@@ -78,6 +79,7 @@ class HuggingFaceChatLLM(LLM):
         cls,
         model_path: str,
         dtype: Any,
+        adapter_path: Optional[str] = None,
         device_map: str = "single",
         chat_template: str = "auto",
         temperature: float = 0.0,
@@ -85,35 +87,84 @@ class HuggingFaceChatLLM(LLM):
         max_new_tokens: int = 512,
         **kwargs: Any,
     ) -> LLM:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
         if device_map not in {"single", "auto"}:
             raise ValueError("device_map must be 'single' or 'auto'")
+        if adapter_path and device_map != "single":
+            raise ValueError(
+                "LoRA inference requires hf_device_map=single; expose exactly "
+                "one GPU with CUDA_VISIBLE_DEVICES=<id>"
+            )
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-        )
-        resolved_device_map: Any = device_map
-        if device_map == "single":
+        if adapter_path:
             import torch
+            from lora_policy import (
+                PolicyModelLoader,
+                policy_config_from_adapter_manifest,
+            )
 
-            resolved_device_map = {"": 0} if torch.cuda.is_available() else None
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            device_map=resolved_device_map,
-            trust_remote_code=True,
-        )
+            dtype_name = {
+                torch.bfloat16: "bf16",
+                torch.float16: "fp16",
+                torch.float32: "fp32",
+            }.get(dtype)
+            if dtype_name is None:
+                raise ValueError(f"Unsupported HF inference dtype: {dtype}")
+            placement = "single" if torch.cuda.is_available() else "cpu"
+            policy_config = policy_config_from_adapter_manifest(
+                model_path,
+                adapter_path,
+                dtype=dtype_name,
+                device_map=placement,
+            )
+            bundle = PolicyModelLoader(policy_config).load_for_inference(
+                adapter_path=adapter_path,
+            )
+            tokenizer = bundle.tokenizer
+            model = bundle.model
+            resolved_adapter_path = bundle.adapter_path
+        else:
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                trust_remote_code=True,
+                local_files_only=True,
+            )
+            resolved_device_map: Any = device_map
+            if device_map == "single":
+                import torch
+
+                resolved_device_map = (
+                    {"": 0} if torch.cuda.is_available() else None
+                )
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=dtype,
+                device_map=resolved_device_map,
+                trust_remote_code=True,
+                local_files_only=True,
+                use_safetensors=True,
+            )
+            for parameter in model.parameters():
+                parameter.requires_grad_(False)
+            model.eval()
+            if any(parameter.requires_grad for parameter in model.parameters()):
+                raise RuntimeError(
+                    "Frozen base-model inference left trainable parameters"
+                )
+            resolved_adapter_path = None
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
         tokenizer.padding_side = "left"
         model.eval()
+        if hasattr(model.config, "use_cache"):
+            model.config.use_cache = True
 
         return cls(
             model=model,
             tokenizer=tokenizer,
             model_path=model_path,
+            adapter_path=resolved_adapter_path,
             chat_template=chat_template,
             temperature=temperature,
             top_p=top_p,
@@ -178,6 +229,7 @@ class HuggingFaceChatLLM(LLM):
     def _identifying_params(self) -> Mapping[str, Any]:
         return {
             "model_path": self.model_path,
+            "adapter_path": self.adapter_path,
             "chat_template": self.chat_template,
             "temperature": self.temperature,
             "top_p": self.top_p,
