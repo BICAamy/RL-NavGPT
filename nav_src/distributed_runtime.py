@@ -22,6 +22,118 @@ class DistributedOperationError(RuntimeError):
     """Raised on worker ranks when a rank-zero operation fails."""
 
 
+def configure_trainable_only_ddp(
+    model: Any,
+    distributed_context: "DistributedContext",
+) -> dict[str, Any]:
+    """Exclude frozen policy state from DDP synchronization.
+
+    Every rank loads the frozen Qwen backbone from the same immutable local
+    checkpoint before Transformers asks Accelerate to wrap the PEFT model in
+    DDP.  PyTorch DDP nevertheless synchronizes *all* module parameters during
+    construction by default, including frozen parameters.  Qwen2.5-14B's
+    1.45-GiB token embedding is large enough to fail on NCCL SHM transports
+    even though only the much smaller LoRA tensors require synchronization.
+
+    PyTorch 2.7.1 exposes a pinned prototype helper for declaring parameters
+    and buffers outside DDP's synchronization boundary.  Keep every trainable
+    LoRA parameter inside DDP and exclude only frozen parameters and fixed
+    buffers.  Checkpoint/state-dict behavior is unchanged because the tensors
+    remain registered on the underlying PEFT model.
+    """
+
+    named_parameters = list(model.named_parameters())
+    trainable = [
+        (name, parameter)
+        for name, parameter in named_parameters
+        if bool(getattr(parameter, "requires_grad", False))
+    ]
+    if not trainable:
+        raise DistributedConfigurationError(
+            "Cannot configure DDP for a policy with zero trainable parameters"
+        )
+
+    frozen = [
+        (name, parameter)
+        for name, parameter in named_parameters
+        if not bool(getattr(parameter, "requires_grad", False))
+    ]
+    buffers = list(model.named_buffers())
+    ignored_names = [name for name, _ in frozen]
+    ignored_names.extend(name for name, _ in buffers)
+    if len(set(ignored_names)) != len(ignored_names):
+        raise DistributedConfigurationError(
+            "Policy parameter and buffer names overlap in the DDP ignore set"
+        )
+
+    report = {
+        "applied": False,
+        "trainable_parameter_count": len(trainable),
+        "trainable_parameter_elements": sum(
+            int(parameter.numel()) for _, parameter in trainable
+        ),
+        "ignored_frozen_parameter_count": len(frozen),
+        "ignored_frozen_parameter_elements": sum(
+            int(parameter.numel()) for _, parameter in frozen
+        ),
+        "ignored_buffer_count": len(buffers),
+    }
+    if not distributed_context.is_distributed:
+        return report
+    if distributed_context.mode != "ddp":
+        raise DistributedConfigurationError(
+            "world_size>1 requires DDP before configuring its policy boundary"
+        )
+
+    torch_module = distributed_context._torch
+    if torch_module is None:
+        try:
+            import torch as torch_module
+        except ImportError as exc:
+            raise DistributedConfigurationError(
+                "Configuring the DDP policy boundary requires PyTorch"
+            ) from exc
+    ddp_class = torch_module.nn.parallel.DistributedDataParallel
+    setter = getattr(
+        ddp_class,
+        "_set_params_and_buffers_to_ignore_for_model",
+        None,
+    )
+    if not callable(setter):
+        raise DistributedConfigurationError(
+            "Pinned PyTorch does not expose the audited DDP ignore helper"
+        )
+
+    previous = getattr(model, "_ddp_params_and_buffers_to_ignore", None)
+    if previous is not None and set(previous) != set(ignored_names):
+        raise DistributedConfigurationError(
+            "Policy already has a different DDP parameter ignore boundary"
+        )
+    setter(model, ignored_names)
+    actual = set(
+        getattr(model, "_ddp_params_and_buffers_to_ignore", ())
+    )
+    expected = set(ignored_names)
+    if actual != expected:
+        raise DistributedConfigurationError(
+            "PyTorch did not install the complete DDP parameter ignore boundary"
+        )
+    trainable_names = {name for name, _ in trainable}
+    if actual.intersection(trainable_names):
+        raise DistributedConfigurationError(
+            "DDP ignore boundary accidentally contains trainable LoRA parameters"
+        )
+    if any(
+        bool(getattr(parameter, "_ddp_ignored", False))
+        for _, parameter in trainable
+    ):
+        raise DistributedConfigurationError(
+            "A trainable LoRA parameter was previously marked DDP-ignored"
+        )
+    report["applied"] = True
+    return report
+
+
 def _environment_integer(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None:

@@ -16,7 +16,11 @@ if str(NAV_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(NAV_SRC_DIR))
 
 from action_plan_cache import canonical_json, sha256_text  # noqa: E402
-from distributed_runtime import DistributedContext  # noqa: E402
+from distributed_runtime import (  # noqa: E402
+    DistributedContext,
+    configure_trainable_only_ddp,
+    single_process_context,
+)
 from grpo_runtime import (  # noqa: E402
     CHECKPOINT_MANIFEST_NAME,
     NavigationMetricsRecorder,
@@ -173,6 +177,48 @@ def _worker(
         initialized_here=False,
         _torch=torch,
     )
+
+    class TinyDDPPolicy(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.backbone = torch.nn.Linear(4, 4, bias=False)
+            self.backbone.weight.requires_grad_(False)
+            self.lora = torch.nn.Linear(4, 2, bias=False)
+            self.register_buffer("fixed_scale", torch.ones(1))
+
+        def forward(self, value: Any) -> Any:
+            return self.lora(value) + self.backbone(value)[:, :2]
+
+    ddp_policy = TinyDDPPolicy()
+    with torch.no_grad():
+        ddp_policy.backbone.weight.fill_(float(rank + 1))
+        ddp_policy.lora.weight.fill_(float(rank + 1))
+        ddp_policy.fixed_scale.fill_(float(rank + 1))
+    boundary = configure_trainable_only_ddp(ddp_policy, context)
+    require(boundary["applied"] is True,
+            "Real Gloo DDP boundary was not installed")
+    wrapped_policy = torch.nn.parallel.DistributedDataParallel(ddp_policy)
+    # DDP must synchronize the trainable LoRA tensor from rank zero while
+    # leaving the locally loaded frozen state outside all DDP collectives.
+    require(
+        float(ddp_policy.lora.weight[0, 0].detach()) == 1.0,
+        "DDP did not synchronize the trainable LoRA tensor",
+    )
+    require(
+        float(ddp_policy.backbone.weight[0, 0]) == float(rank + 1),
+        "DDP unexpectedly synchronized the ignored frozen backbone",
+    )
+    require(
+        float(ddp_policy.fixed_scale[0]) == float(rank + 1),
+        "DDP unexpectedly synchronized the ignored fixed buffer",
+    )
+    wrapped_policy(torch.ones(2, 4)).sum().backward()
+    require(
+        ddp_policy.lora.weight.grad is not None,
+        "DDP did not retain LoRA gradient reduction hooks",
+    )
+    context.barrier()
+
     root = Path(root_value)
     recorder = NavigationMetricsRecorder(
         str(root / "logging"),
@@ -446,11 +492,62 @@ def validate_launcher_contract() -> None:
     )
 
 
+def validate_lora_only_ddp_boundary() -> None:
+    import torch
+
+    class TinyPolicy(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.backbone = torch.nn.Linear(4, 4, bias=False)
+            self.backbone.weight.requires_grad_(False)
+            self.lora = torch.nn.Linear(4, 2, bias=False)
+            self.register_buffer("fixed_scale", torch.ones(1))
+
+    single_model = TinyPolicy()
+    single_report = configure_trainable_only_ddp(
+        single_model,
+        single_process_context(),
+    )
+    require(single_report["applied"] is False,
+            "Single-GPU policy unexpectedly received DDP metadata")
+    require(
+        not hasattr(single_model, "_ddp_params_and_buffers_to_ignore"),
+        "Single-GPU policy was mutated by the DDP boundary helper",
+    )
+
+    model = TinyPolicy()
+    context = DistributedContext(
+        mode="ddp",
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        backend="gloo",
+        initialized_here=False,
+        _torch=torch,
+    )
+    report = configure_trainable_only_ddp(model, context)
+    require(report["applied"] is True,
+            "DDP policy boundary was not installed")
+    ignored = set(model._ddp_params_and_buffers_to_ignore)
+    require(
+        ignored == {"backbone.weight", "fixed_scale"},
+        f"Wrong DDP ignore boundary: {sorted(ignored)}",
+    )
+    require(
+        "lora.weight" not in ignored
+        and not bool(getattr(model.lora.weight, "_ddp_ignored", False)),
+        "Trainable LoRA weight was excluded from DDP",
+    )
+    repeated = configure_trainable_only_ddp(model, context)
+    require(repeated == report, "DDP boundary installation is not idempotent")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.parse_args()
     validate_batch_derivation()
     validate_launcher_contract()
+    validate_lora_only_ddp_boundary()
     import torch
 
     with tempfile.TemporaryDirectory(prefix="navgpt-grpo-ddp-") as value:
@@ -472,6 +569,7 @@ def main() -> None:
     print("- launcher and 1/2/4-GPU batches preserve one complete GRPO group")
     print("- two real Gloo ranks produced one ordered, rank-zero-owned rollout log")
     print("- DDP checkpoints require all-rank RNG and synchronized LoRA tensors")
+    print("- DDP initialization ignores frozen Qwen state but keeps LoRA trainable")
 
 
 if __name__ == "__main__":

@@ -729,6 +729,24 @@ def run_grpo_training(
     if transformers_module is None:
         import transformers as transformers_module
     distributed_context = bundle.metrics_recorder.distributed_context
+    from distributed_runtime import configure_trainable_only_ddp
+
+    ddp_boundary = configure_trainable_only_ddp(
+        bundle.policy.model,
+        distributed_context,
+    )
+    # Preserve the audited boundary for validation/debugging without changing
+    # Transformers' checkpoint schema.
+    bundle.trainer.navgpt_ddp_parameter_boundary = dict(ddp_boundary)
+    if distributed_context.is_main_process and ddp_boundary["applied"]:
+        print(
+            "DDP LoRA-only boundary: "
+            f"trainable_tensors={ddp_boundary['trainable_parameter_count']} "
+            f"ignored_frozen_tensors="
+            f"{ddp_boundary['ignored_frozen_parameter_count']} "
+            f"ignored_buffers={ddp_boundary['ignored_buffer_count']}",
+            flush=True,
+        )
     checkpoint_callback = make_grpo_checkpoint_callback(
         policy=bundle.policy,
         run_manifest=run_manifest,

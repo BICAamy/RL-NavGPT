@@ -137,6 +137,7 @@ class FakeGRPOConfig:
             "fp16",
             "gradient_checkpointing",
             "gradient_checkpointing_kwargs",
+            "ddp_broadcast_buffers",
             "max_steps",
             "num_train_epochs",
             "logging_strategy",
@@ -776,6 +777,8 @@ def validate_trainer_assembly(components: Any) -> None:
             "Checkpoint would omit optimizer/RNG state")
     require(bundle.args.optim == "adamw_torch",
             "First-run optimizer is not explicit")
+    require(bundle.args.ddp_broadcast_buffers is False,
+            "Frozen Qwen buffers would be broadcast by DDP")
     require(bundle.metrics_recorder is not None,
             "Navigation metrics recorder was not attached")
 

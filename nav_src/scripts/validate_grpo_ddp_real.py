@@ -356,10 +356,6 @@ def main() -> None:
     resumed = root / "resumed"
     worker_environment = dict(os.environ)
     worker_environment.setdefault("PYTHONNOUSERSITE", "1")
-    worker_environment.setdefault(
-        "PYTORCH_CUDA_ALLOC_CONF",
-        "expandable_segments:True",
-    )
     worker_environment.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
 
     subprocess.run(

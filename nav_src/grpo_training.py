@@ -906,6 +906,11 @@ def build_trl_grpo_config(
         "fp16": config.mixed_precision == "fp16",
         "gradient_checkpointing": True,
         "gradient_checkpointing_kwargs": {"use_reentrant": False},
+        # Qwen has no mutable BatchNorm-style state.  Every rank loads the same
+        # fixed buffers locally, so broadcasting them on every DDP forward is
+        # both unnecessary and contrary to the LoRA-only synchronization
+        # boundary installed immediately before training.
+        "ddp_broadcast_buffers": False,
         # GRPO compares policy/old/reference log-probabilities for the same
         # tokens. Training-time LoRA dropout would give those forwards
         # different random masks and create artificial ratios/KL.
