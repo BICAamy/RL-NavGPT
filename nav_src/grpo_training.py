@@ -152,7 +152,7 @@ class GRPOComponentConfig:
 
 @dataclass(frozen=True)
 class GRPOOptimizationConfig:
-    """Explicit single-GPU GRPO settings for the first correct implementation."""
+    """Explicit single-GPU or DDP GRPO optimization settings."""
 
     output_dir: str
     max_completion_length: Optional[int] = None
@@ -177,6 +177,8 @@ class GRPOOptimizationConfig:
     save_total_limit: int = 3
     trajectory_log_interval: int = 10
     seed: int = 0
+    distributed_mode: str = "single"
+    world_size: int = 1
 
     def __post_init__(self) -> None:
         if not str(self.output_dir).strip():
@@ -197,25 +199,41 @@ class GRPOOptimizationConfig:
             raise ValueError("GRPO requires num_generations >= 2")
         if self.per_device_train_batch_size != 1:
             raise ValueError(
-                "The first stage-six implementation supports single-GPU "
+                "The first stage-six implementation supports "
                 "per_device_train_batch_size=1 only"
             )
+        if self.distributed_mode not in {"single", "ddp"}:
+            raise ValueError("distributed_mode must be single or ddp")
+        if (
+            isinstance(self.world_size, bool)
+            or not isinstance(self.world_size, int)
+            or self.world_size <= 0
+        ):
+            raise ValueError("world_size must be a positive integer")
+        if self.distributed_mode == "single" and self.world_size != 1:
+            raise ValueError("single mode requires world_size=1")
+        if self.distributed_mode == "ddp" and self.world_size < 2:
+            raise ValueError("ddp mode requires world_size>=2")
         generation_batch_size = (
-            self.per_device_train_batch_size * self.steps_per_generation
+            self.per_device_train_batch_size
+            * self.steps_per_generation
+            * self.world_size
         )
         if generation_batch_size % self.num_generations != 0:
             raise ValueError(
-                "per_device_train_batch_size * steps_per_generation must be "
-                "divisible by num_generations"
+                "per_device_train_batch_size * world_size * "
+                "steps_per_generation must be divisible by num_generations"
             )
         effective_batch_size = (
             self.per_device_train_batch_size
             * self.gradient_accumulation_steps
+            * self.world_size
         )
         if effective_batch_size % self.num_generations != 0:
             raise ValueError(
-                "per_device_train_batch_size * gradient_accumulation_steps "
-                "must be divisible by num_generations"
+                "per_device_train_batch_size * world_size * "
+                "gradient_accumulation_steps must be divisible by "
+                "num_generations"
             )
         if self.gradient_accumulation_steps % self.steps_per_generation != 0:
             raise ValueError(
@@ -1017,6 +1035,7 @@ def build_grpo_trainer(
     transformers_module: Optional[ModuleType] = None,
     peft_module: Optional[ModuleType] = None,
     jmespath_module: Optional[ModuleType] = None,
+    distributed_context: Optional[Any] = None,
 ) -> GRPOTrainerBundle:
     """Create TRL's trainer around an already validated LoRA policy bundle."""
 
@@ -1051,11 +1070,45 @@ def build_grpo_trainer(
         make_recording_environment_reward,
         navigation_grpo_trainer_class,
     )
+    if distributed_context is None:
+        from distributed_runtime import single_process_context
+
+        distributed_context = single_process_context()
+    if (
+        optimization.world_size != distributed_context.world_size
+        or optimization.distributed_mode != distributed_context.mode
+    ):
+        raise ValueError(
+            "GRPO optimization topology differs from the active process "
+            f"context: optimization={optimization.distributed_mode}/"
+            f"{optimization.world_size}, context={distributed_context.mode}/"
+            f"{distributed_context.world_size}"
+        )
+    configured_world_size = int(
+        getattr(args, "world_size", optimization.world_size)
+    )
+    if configured_world_size != optimization.world_size:
+        raise ValueError(
+            "TRL resolved a different world size from the active topology: "
+            f"trl={configured_world_size}, expected={optimization.world_size}"
+        )
+    generation_batch_size = getattr(args, "generation_batch_size", None)
+    if (
+        generation_batch_size is not None
+        and int(generation_batch_size) != optimization.num_generations
+    ):
+        raise ValueError(
+            "The production topology requires exactly one GRPO group per "
+            "generation buffer: "
+            f"generation_batch_size={generation_batch_size}, "
+            f"num_generations={optimization.num_generations}"
+        )
 
     metrics_recorder = NavigationMetricsRecorder(
         optimization.output_dir,
         num_generations=optimization.num_generations,
         trajectory_log_interval=optimization.trajectory_log_interval,
+        distributed_context=distributed_context,
     )
     reward_func = make_recording_environment_reward(metrics_recorder)
     trainer_cls = navigation_grpo_trainer_class(
@@ -1086,6 +1139,7 @@ def build_grpo_trainer(
             "policy": policy_contract,
             "navigation_logging": True,
             "standard_trainer_checkpoint": True,
+            "distributed": distributed_context.topology,
         },
     )
 
@@ -1096,6 +1150,7 @@ def load_policy_and_build_grpo_trainer(
     optimization: GRPOOptimizationConfig,
     *,
     adapter_path: Optional[str] = None,
+    distributed_context: Optional[Any] = None,
 ) -> GRPOTrainerBundle:
     """Explicit heavy entry point used later by the real stage-six smoke test."""
 
@@ -1117,7 +1172,12 @@ def load_policy_and_build_grpo_trainer(
             f"{component_model_path} versus {policy_model_path}"
         )
     policy = PolicyModelLoader(policy_config).load(adapter_path=adapter_path)
-    return build_grpo_trainer(policy, components, optimization)
+    return build_grpo_trainer(
+        policy,
+        components,
+        optimization,
+        distributed_context=distributed_context,
+    )
 
 
 def seed_grpo_policy_initialization(

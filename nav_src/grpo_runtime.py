@@ -26,8 +26,8 @@ from rl_env import NavGPTTRLEnvironment, trl_environment_reward
 
 RUN_MANIFEST_NAME = "navgpt_grpo_run_manifest.json"
 CHECKPOINT_MANIFEST_NAME = "navgpt_grpo_checkpoint.json"
-RUN_MANIFEST_SCHEMA_VERSION = 2
-CHECKPOINT_MANIFEST_SCHEMA_VERSION = 1
+RUN_MANIFEST_SCHEMA_VERSION = 3
+CHECKPOINT_MANIFEST_SCHEMA_VERSION = 2
 ROLLOUT_LOG_NAME = "navigation_rollouts.jsonl"
 TRAIN_LOG_NAME = "train_metrics.jsonl"
 SESSION_LOG_NAME = "training_sessions.jsonl"
@@ -45,6 +45,7 @@ class GRPOTrainingResult:
     final_adapter_path: str
     train_metrics: Mapping[str, Any]
     resumed_from_checkpoint: Optional[str]
+    trainable_parameter_sha256: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -52,6 +53,7 @@ class GRPOTrainingResult:
             "final_adapter_path": self.final_adapter_path,
             "train_metrics": dict(self.train_metrics),
             "resumed_from_checkpoint": self.resumed_from_checkpoint,
+            "trainable_parameter_sha256": self.trainable_parameter_sha256,
         }
 
 
@@ -64,11 +66,17 @@ class NavigationMetricsRecorder:
         *,
         num_generations: int,
         trajectory_log_interval: int,
+        distributed_context: Optional[Any] = None,
     ) -> None:
         if num_generations < 2:
             raise ValueError("num_generations must be at least 2")
         if trajectory_log_interval < 0:
             raise ValueError("trajectory_log_interval must be nonnegative")
+        if distributed_context is None:
+            from distributed_runtime import single_process_context
+
+            distributed_context = single_process_context()
+        self.distributed_context = distributed_context
         self.output_dir = Path(output_dir).expanduser().resolve()
         self.log_dir = self.output_dir / "logs"
         self.rollout_log_path = self.log_dir / ROLLOUT_LOG_NAME
@@ -77,8 +85,10 @@ class NavigationMetricsRecorder:
         self.num_generations = int(num_generations)
         self.trajectory_log_interval = int(trajectory_log_interval)
         self._pending: List[Dict[str, Any]] = []
-        self._rollout_count = _read_existing_rollout_count(
-            self.rollout_log_path
+        self._rollout_count = (
+            _read_existing_rollout_count(self.rollout_log_path)
+            if self.distributed_context.is_main_process
+            else 0
         )
         self._session_index: Optional[int] = None
         self._resumed_from_global_step: Optional[int] = None
@@ -87,31 +97,47 @@ class NavigationMetricsRecorder:
     def start_session(self, resume_from_checkpoint: Optional[str]) -> None:
         """Begin one auditable process session before any rollout is written."""
 
-        with self._lock:
-            if self._session_index is not None:
-                raise GRPORuntimeError("Navigation logging session already started")
-            existing_count = _read_existing_session_count(self.session_log_path)
-            if resume_from_checkpoint is None:
-                resumed_step = None
-            else:
-                checkpoint_name = Path(resume_from_checkpoint).name
-                match = re.fullmatch(r"checkpoint-(\d+)", checkpoint_name)
-                if match is None:
-                    raise GRPORuntimeError(
-                        "Cannot derive logging session step from checkpoint: "
-                        f"{checkpoint_name}"
-                    )
-                resumed_step = int(match.group(1))
-            row = {
-                "schema_version": 1,
-                "session_index": existing_count,
-                "resumed_from_checkpoint": resume_from_checkpoint,
-                "resumed_from_global_step": resumed_step,
-                "first_rollout_index": self._rollout_count,
-            }
-            _append_jsonl(self.session_log_path, [row])
-            self._session_index = existing_count
-            self._resumed_from_global_step = resumed_step
+        if self._session_index is not None:
+            raise GRPORuntimeError("Navigation logging session already started")
+
+        def initialize_session() -> Dict[str, Any]:
+            with self._lock:
+                existing_count = _read_existing_session_count(
+                    self.session_log_path
+                )
+                if resume_from_checkpoint is None:
+                    resumed_step = None
+                else:
+                    checkpoint_name = Path(resume_from_checkpoint).name
+                    match = re.fullmatch(r"checkpoint-(\d+)", checkpoint_name)
+                    if match is None:
+                        raise GRPORuntimeError(
+                            "Cannot derive logging session step from checkpoint: "
+                            f"{checkpoint_name}"
+                        )
+                    resumed_step = int(match.group(1))
+                row = {
+                    "schema_version": 2,
+                    "session_index": existing_count,
+                    "resumed_from_checkpoint": resume_from_checkpoint,
+                    "resumed_from_global_step": resumed_step,
+                    "first_rollout_index": self._rollout_count,
+                    "distributed_mode": self.distributed_context.mode,
+                    "world_size": self.distributed_context.world_size,
+                }
+                _append_jsonl(self.session_log_path, [row])
+                return row
+
+        row = self.distributed_context.call_on_main_and_broadcast(
+            initialize_session
+        )
+        self._session_index = int(row["session_index"])
+        resumed_value = row.get("resumed_from_global_step")
+        self._resumed_from_global_step = (
+            None if resumed_value is None else int(resumed_value)
+        )
+        if not self.distributed_context.is_main_process:
+            self._rollout_count = int(row["first_rollout_index"])
 
     def record(
         self,
@@ -129,52 +155,85 @@ class NavigationMetricsRecorder:
                 "start_session() must be called before recording rollouts"
             )
         global_step = int(getattr(trainer_state, "global_step", 0) or 0)
+        local_rows: List[Dict[str, Any]] = []
+        for local_index, (environment, reward) in enumerate(
+            zip(environments, rewards)
+        ):
+            summary = environment.rollout_summary
+            if summary is None:
+                raise GRPORuntimeError(
+                    "Navigation reward was logged before rollout finalization"
+                )
+            if not math.isclose(
+                float(reward),
+                float(summary.episode_return),
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                raise GRPORuntimeError(
+                    "Logged reward differs from the finalized episode return"
+                )
+
+            row = {
+                "schema_version": 2,
+                "global_step": global_step,
+                "process_rank": self.distributed_context.rank,
+                "local_rollout_index": local_index,
+                "session_index": self._session_index,
+                "resumed_from_global_step": self._resumed_from_global_step,
+                **summary.as_dict(),
+            }
+            row["_trajectory_steps"] = [
+                _compact_trajectory_step(step)
+                for step in environment.trajectory
+            ]
+            _require_finite_rollout(row)
+            local_rows.append(row)
+
+        gathered = self.distributed_context.all_gather_object(local_rows)
+        if not self.distributed_context.is_main_process:
+            return
         with self._lock:
             rows: List[Dict[str, Any]] = []
-            for environment, reward in zip(environments, rewards):
-                summary = environment.rollout_summary
-                if summary is None:
-                    raise GRPORuntimeError(
-                        "Navigation reward was logged before rollout finalization"
-                    )
-                if not math.isclose(
-                    float(reward),
-                    float(summary.episode_return),
-                    rel_tol=0.0,
-                    abs_tol=1e-9,
-                ):
-                    raise GRPORuntimeError(
-                        "Logged reward differs from the finalized episode return"
-                    )
-
-                rollout_index = self._rollout_count
-                group_index = rollout_index // self.num_generations
-                row = {
-                    "schema_version": 1,
-                    "global_step": global_step,
-                    "rollout_index": rollout_index,
-                    "group_index": group_index,
-                    "session_index": self._session_index,
-                    "resumed_from_global_step": self._resumed_from_global_step,
-                    **summary.as_dict(),
-                }
-                if (
-                    self.trajectory_log_interval > 0
-                    and group_index % self.trajectory_log_interval == 0
-                ):
-                    row["trajectory_steps"] = [
-                        _compact_trajectory_step(step)
-                        for step in environment.trajectory
-                    ]
-                _require_finite_rollout(row)
-                rows.append(row)
-                self._pending.append(row)
-                self._rollout_count += 1
+            for rank_rows in gathered:
+                for candidate in rank_rows:
+                    row = dict(candidate)
+                    trajectory_steps = row.pop("_trajectory_steps")
+                    rollout_index = self._rollout_count
+                    group_index = rollout_index // self.num_generations
+                    row["rollout_index"] = rollout_index
+                    row["group_index"] = group_index
+                    if (
+                        self.trajectory_log_interval > 0
+                        and group_index % self.trajectory_log_interval == 0
+                    ):
+                        row["trajectory_steps"] = trajectory_steps
+                    _require_finite_rollout(row)
+                    rows.append(row)
+                    self._pending.append(row)
+                    self._rollout_count += 1
+            if len(rows) % self.num_generations != 0:
+                raise GRPORuntimeError(
+                    "Distributed rollout batch does not contain complete "
+                    f"GRPO groups: rows={len(rows)}, "
+                    f"num_generations={self.num_generations}"
+                )
+            if self.distributed_context.is_distributed:
+                for offset in range(0, len(rows), self.num_generations):
+                    group = rows[offset : offset + self.num_generations]
+                    instr_ids = {str(row.get("instr_id")) for row in group}
+                    if len(instr_ids) != 1:
+                        raise GRPORuntimeError(
+                            "A gathered GRPO group contains different tasks: "
+                            f"{sorted(instr_ids)}"
+                        )
             _append_jsonl(self.rollout_log_path, rows)
 
     def drain_metrics(self) -> Dict[str, float]:
         """Aggregate every rollout generated since the previous Trainer log."""
 
+        if not self.distributed_context.is_main_process:
+            return {}
         with self._lock:
             rows = self._pending
             self._pending = []
@@ -310,6 +369,10 @@ def build_grpo_run_manifest(
     policy_values["model_path"] = str(
         Path(policy_config.model_path).expanduser().resolve()
     )
+    component_values = _dataclass_values(components.config)
+    component_paths = _dataclass_values(paths)
+    component_paths.pop("output_dir", None)
+    component_values["paths"] = component_paths
     policy_model_root = Path(policy_config.model_path).expanduser().resolve()
     sources = {
         "annotation_sha256": sha256_file(paths.annotation),
@@ -356,6 +419,7 @@ def build_grpo_run_manifest(
         "implementation_sha256": _selected_files_digest(
             Path(__file__).resolve().parent,
             required=(
+                "distributed_runtime.py",
                 "grpo_runtime.py",
                 "grpo_training.py",
                 "lora_policy.py",
@@ -370,6 +434,8 @@ def build_grpo_run_manifest(
                 "utils/graph_utils.py",
                 "prompt/chat_prompt.py",
                 "prompt/planner_prompt.py",
+                "scripts/launch_grpo.py",
+                "scripts/train_grpo.py",
             ),
             optional=(),
         ),
@@ -383,12 +449,16 @@ def build_grpo_run_manifest(
         },
         "policy": policy_values,
         "optimization": optimization_values,
+        "distributed": {
+            "mode": optimization.distributed_mode,
+            "world_size": optimization.world_size,
+        },
         "environment": {
             "task_count": len(components.task_records),
             "task_records_sha256": sha256_text(
                 canonical_json(list(components.task_records))
             ),
-            "component_config": _dataclass_values(components.config),
+            "component_config": component_values,
         },
         "sources": sources,
     }
@@ -403,8 +473,36 @@ def prepare_grpo_run(
     resume_from_checkpoint: Optional[str],
     policy_config: Any,
     require_reference_adapter: bool,
+    distributed_context: Optional[Any] = None,
 ) -> Optional[Path]:
     """Initialize a new output directory or validate an exact resume point."""
+
+    if distributed_context is None:
+        from distributed_runtime import single_process_context
+
+        distributed_context = single_process_context()
+
+    result = distributed_context.call_on_main_and_broadcast(
+        lambda: _prepare_grpo_run_local(
+            manifest,
+            output_dir=output_dir,
+            resume_from_checkpoint=resume_from_checkpoint,
+            policy_config=policy_config,
+            require_reference_adapter=require_reference_adapter,
+        )
+    )
+    return None if result is None else Path(result)
+
+
+def _prepare_grpo_run_local(
+    manifest: Mapping[str, Any],
+    *,
+    output_dir: str,
+    resume_from_checkpoint: Optional[str],
+    policy_config: Any,
+    require_reference_adapter: bool,
+) -> Optional[str]:
+    """Rank-zero implementation for :func:`prepare_grpo_run`."""
 
     output = Path(output_dir).expanduser().resolve()
     _validate_run_manifest(manifest)
@@ -442,7 +540,7 @@ def prepare_grpo_run(
         expected_run_manifest=manifest,
         require_reference_adapter=require_reference_adapter,
     )
-    return checkpoint
+    return str(checkpoint)
 
 
 def make_grpo_checkpoint_callback(
@@ -451,25 +549,37 @@ def make_grpo_checkpoint_callback(
     run_manifest: Mapping[str, Any],
     require_reference_adapter: bool,
     transformers_module: Any,
+    distributed_context: Optional[Any] = None,
 ) -> Any:
     """Create a callback that audits each standard Trainer checkpoint."""
 
+    if distributed_context is None:
+        from distributed_runtime import single_process_context
+
+        distributed_context = single_process_context()
     callback_base = getattr(transformers_module, "TrainerCallback", object)
 
     class NavGPTCheckpointCallback(callback_base):
         def on_save(self, args: Any, state: Any, control: Any, **_: Any) -> Any:
-            if not bool(getattr(state, "is_world_process_zero", True)):
-                return control
             checkpoint = (
                 Path(args.output_dir).expanduser().resolve()
                 / f"checkpoint-{int(state.global_step)}"
             )
-            _finalize_checkpoint(
-                checkpoint,
-                policy=policy,
-                run_manifest=run_manifest,
-                require_reference_adapter=require_reference_adapter,
+            parameter_sha256 = _audit_trainable_parameter_sync(
+                policy,
+                distributed_context,
             )
+            distributed_context.barrier()
+            distributed_context.call_on_main_and_broadcast(
+                lambda: _finalize_checkpoint(
+                    checkpoint,
+                    policy=policy,
+                    run_manifest=run_manifest,
+                    require_reference_adapter=require_reference_adapter,
+                    trainable_parameter_sha256=parameter_sha256,
+                )
+            )
+            distributed_context.barrier()
             return control
 
     return NavGPTCheckpointCallback()
@@ -510,8 +620,19 @@ def validate_grpo_checkpoint(
     if requires_scaler:
         required.append("scaler.pt")
     missing = [name for name in required if not (checkpoint / name).is_file()]
-    if not list(checkpoint.glob("rng_state*.pth")):
-        missing.append("rng_state*.pth")
+    expected_rng_names = _expected_rng_state_names(expected_run_manifest)
+    actual_rng_names = {
+        path.name for path in checkpoint.glob("rng_state*.pth")
+    }
+    for name in expected_rng_names:
+        if name not in actual_rng_names:
+            missing.append(name)
+    unexpected_rng_names = actual_rng_names.difference(expected_rng_names)
+    if unexpected_rng_names:
+        raise GRPORuntimeError(
+            "Checkpoint RNG topology differs from the run manifest: "
+            f"unexpected={sorted(unexpected_rng_names)}"
+        )
     if require_reference_adapter:
         for name in ("ref/adapter_config.json", "ref/adapter_model.safetensors"):
             if not (checkpoint / name).is_file():
@@ -542,6 +663,19 @@ def validate_grpo_checkpoint(
         "run_fingerprint"
     ):
         raise GRPORuntimeError("Checkpoint manifest has the wrong run fingerprint")
+    if canonical_json(metadata.get("distributed")) != canonical_json(
+        expected_run_manifest.get("distributed")
+    ):
+        raise GRPORuntimeError(
+            "Checkpoint manifest has the wrong distributed topology"
+        )
+    parameter_sha256 = str(
+        metadata.get("trainable_parameter_sha256", "")
+    )
+    if re.fullmatch(r"[0-9a-f]{64}", parameter_sha256) is None:
+        raise GRPORuntimeError(
+            "Checkpoint manifest has no valid synchronized LoRA fingerprint"
+        )
     files = metadata.get("files")
     if not isinstance(files, Mapping) or not files:
         raise GRPORuntimeError("Checkpoint manifest has no file inventory")
@@ -554,8 +688,7 @@ def validate_grpo_checkpoint(
         "scheduler.pt",
         "training_args.bin",
         RUN_MANIFEST_NAME,
-        *(path.relative_to(checkpoint).as_posix()
-          for path in checkpoint.glob("rng_state*.pth")),
+        *expected_rng_names,
     }
     if requires_scaler or scaler_path.is_file():
         expected_inventory.add("scaler.pt")
@@ -595,11 +728,13 @@ def run_grpo_training(
 
     if transformers_module is None:
         import transformers as transformers_module
+    distributed_context = bundle.metrics_recorder.distributed_context
     checkpoint_callback = make_grpo_checkpoint_callback(
         policy=bundle.policy,
         run_manifest=run_manifest,
         require_reference_adapter=float(bundle.args.beta) > 0.0,
         transformers_module=transformers_module,
+        distributed_context=distributed_context,
     )
     bundle.trainer.add_callback(checkpoint_callback)
     bundle.metrics_recorder.start_session(resume_from_checkpoint)
@@ -607,12 +742,16 @@ def run_grpo_training(
         resume_from_checkpoint=resume_from_checkpoint
     )
     metrics = dict(getattr(train_result, "metrics", {}) or {})
-    if _is_world_process_zero(bundle.trainer):
+    global_step = int(bundle.trainer.state.global_step)
+    trainable_parameter_sha256 = _audit_trainable_parameter_sync(
+        bundle.policy,
+        distributed_context,
+    )
+
+    def save_final_adapter() -> str:
         bundle.trainer.log_metrics("train", metrics)
         bundle.trainer.save_metrics("train", metrics)
         bundle.trainer.save_state()
-
-        global_step = int(bundle.trainer.state.global_step)
         final_adapter = (
             Path(bundle.args.output_dir).expanduser().resolve()
             / f"final-adapter-step-{global_step}"
@@ -629,22 +768,27 @@ def run_grpo_training(
         _write_json_atomic(
             final_adapter / "navgpt_grpo_final.json",
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "global_step": global_step,
                 "run_fingerprint": run_manifest["run_fingerprint"],
                 "resumed_from_checkpoint": resume_from_checkpoint,
+                "distributed": run_manifest["distributed"],
+                "trainable_parameter_sha256": trainable_parameter_sha256,
             },
             exclusive=True,
         )
-        final_path = str(final_adapter)
-    else:
-        global_step = int(bundle.trainer.state.global_step)
-        final_path = ""
+        return str(final_adapter)
+
+    final_path = distributed_context.call_on_main_and_broadcast(
+        save_final_adapter
+    )
+    distributed_context.barrier()
     return GRPOTrainingResult(
         global_step=global_step,
         final_adapter_path=final_path,
         train_metrics=metrics,
         resumed_from_checkpoint=resume_from_checkpoint,
+        trainable_parameter_sha256=trainable_parameter_sha256,
     )
 
 
@@ -654,6 +798,7 @@ def _finalize_checkpoint(
     policy: Any,
     run_manifest: Mapping[str, Any],
     require_reference_adapter: bool,
+    trainable_parameter_sha256: Optional[str] = None,
 ) -> None:
     from lora_policy import write_lora_adapter_manifest
 
@@ -678,10 +823,8 @@ def _finalize_checkpoint(
         "training_args.bin",
         RUN_MANIFEST_NAME,
     ]
-    inventory_names.extend(
-        path.relative_to(checkpoint).as_posix()
-        for path in sorted(checkpoint.glob("rng_state*.pth"))
-    )
+    expected_rng_names = _expected_rng_state_names(run_manifest)
+    inventory_names.extend(expected_rng_names)
     scaler_path = checkpoint / "scaler.pt"
     requires_scaler = str(policy.config.dtype) == "fp16"
     if requires_scaler or scaler_path.is_file():
@@ -711,10 +854,78 @@ def _finalize_checkpoint(
             "global_step": int(state["global_step"]),
             "run_fingerprint": run_manifest["run_fingerprint"],
             "contains_base_model": False,
+            "distributed": run_manifest["distributed"],
+            "trainable_parameter_sha256": trainable_parameter_sha256,
             "files": files,
         },
         exclusive=True,
     )
+
+
+def _expected_rng_state_names(
+    run_manifest: Mapping[str, Any],
+) -> List[str]:
+    distributed = run_manifest.get("distributed")
+    if not isinstance(distributed, Mapping):
+        raise GRPORuntimeError("Run manifest omitted distributed topology")
+    world_size = distributed.get("world_size")
+    if (
+        isinstance(world_size, bool)
+        or not isinstance(world_size, int)
+    ):
+        raise GRPORuntimeError(
+            "Run manifest has an invalid distributed world_size"
+        )
+    mode = str(distributed.get("mode", ""))
+    if world_size <= 0:
+        raise GRPORuntimeError("Run manifest world_size must be positive")
+    if world_size == 1:
+        if mode != "single":
+            raise GRPORuntimeError(
+                "world_size=1 requires distributed mode 'single'"
+            )
+        return ["rng_state.pth"]
+    if mode != "ddp":
+        raise GRPORuntimeError(
+            "world_size>1 requires distributed mode 'ddp'"
+        )
+    return [f"rng_state_{rank}.pth" for rank in range(world_size)]
+
+
+def _audit_trainable_parameter_sync(
+    policy: Any,
+    distributed_context: Any,
+) -> str:
+    """Require byte-identical trainable LoRA tensors on every DDP rank."""
+
+    import torch
+
+    digest = hashlib.sha256()
+    trainable_count = 0
+    for name, parameter in policy.model.named_parameters():
+        if not bool(getattr(parameter, "requires_grad", False)):
+            continue
+        trainable_count += 1
+        tensor = parameter.detach().contiguous()
+        digest.update(str(name).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(canonical_json(list(tensor.shape)).encode("ascii"))
+        digest.update(b"\0")
+        byte_tensor = tensor.view(-1).view(dtype=torch.uint8)
+        digest.update(byte_tensor.cpu().numpy().tobytes())
+        digest.update(b"\0")
+    if trainable_count <= 0:
+        raise GRPORuntimeError("Cannot fingerprint zero trainable parameters")
+    local_digest = digest.hexdigest()
+    gathered = distributed_context.all_gather_object(local_digest)
+    if len(set(str(value) for value in gathered)) != 1:
+        raise GRPORuntimeError(
+            "Trainable LoRA parameters diverged across DDP ranks: "
+            f"{gathered}"
+        )
+    return local_digest
 
 
 def _compact_trajectory_step(step: Mapping[str, Any]) -> Dict[str, Any]:
@@ -886,6 +1097,10 @@ def _read_json(path: Path) -> Dict[str, Any]:
 def _validate_run_manifest(manifest: Mapping[str, Any]) -> None:
     if manifest.get("schema_version") != RUN_MANIFEST_SCHEMA_VERSION:
         raise GRPORuntimeError("Unsupported GRPO run manifest schema")
+    distributed = manifest.get("distributed")
+    if not isinstance(distributed, Mapping):
+        raise GRPORuntimeError("GRPO run manifest omitted distributed topology")
+    _expected_rng_state_names(manifest)
     unsigned = dict(manifest)
     actual = unsigned.pop("run_fingerprint", None)
     expected = sha256_text(canonical_json(unsigned))

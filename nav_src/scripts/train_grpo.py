@@ -1,4 +1,4 @@
-"""Launch the pinned single-GPU TRL GRPO training run.
+"""Launch the pinned single-GPU or DDP TRL GRPO training run.
 
 This is the only production entry point for stage six.  It assembles validated
 R2R/CLIP inputs, initializes or reloads the trainable LoRA adapter, delegates
@@ -17,6 +17,7 @@ NAV_SRC_DIR = Path(__file__).resolve().parents[1]
 if str(NAV_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(NAV_SRC_DIR))
 
+from distributed_runtime import DistributedContext  # noqa: E402
 from grpo_runtime import (  # noqa: E402
     build_grpo_run_manifest,
     prepare_grpo_run,
@@ -35,6 +36,22 @@ from lora_policy import LoRAPolicyConfig  # noqa: E402
 
 def main() -> None:
     args = build_parser().parse_args()
+    distributed = DistributedContext.initialize(args.distributed_mode)
+    try:
+        _run(args, distributed)
+    finally:
+        distributed.close()
+
+
+def _run(args: argparse.Namespace, distributed: DistributedContext) -> None:
+    steps_per_generation, gradient_accumulation_steps = (
+        resolve_parallel_batch_settings(
+            num_generations=args.num_generations,
+            world_size=distributed.world_size,
+            steps_per_generation=args.steps_per_generation,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+        )
+    )
     component_config = GRPOComponentConfig(
         paths=StageSixPaths(
             annotation=args.annotation,
@@ -60,8 +77,8 @@ def main() -> None:
         max_completion_length=args.max_completion_length,
         num_generations=args.num_generations,
         per_device_train_batch_size=1,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        steps_per_generation=args.steps_per_generation,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        steps_per_generation=steps_per_generation,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio,
@@ -79,6 +96,8 @@ def main() -> None:
         save_total_limit=args.save_total_limit,
         trajectory_log_interval=args.trajectory_log_interval,
         seed=args.seed,
+        distributed_mode=distributed.mode,
+        world_size=distributed.world_size,
     )
     policy_config = LoRAPolicyConfig(
         model_path=args.policy_model_path,
@@ -86,17 +105,19 @@ def main() -> None:
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         dtype=args.dtype,
-        device_map="single",
+        device_map=("distributed" if distributed.is_distributed else "single"),
         max_trainable_percentage=args.max_trainable_percentage,
     )
 
     runtime_contract = audit_trl_runtime_contract()
     components = load_grpo_training_components(component_config)
-    run_manifest = build_grpo_run_manifest(
-        policy_config=policy_config,
-        components=components,
-        optimization=optimization,
-        runtime_contract=runtime_contract,
+    run_manifest = distributed.call_on_main_and_broadcast(
+        lambda: build_grpo_run_manifest(
+            policy_config=policy_config,
+            components=components,
+            optimization=optimization,
+            runtime_contract=runtime_contract,
+        )
     )
     checkpoint = prepare_grpo_run(
         run_manifest,
@@ -104,12 +125,14 @@ def main() -> None:
         resume_from_checkpoint=args.resume_from_checkpoint,
         policy_config=policy_config,
         require_reference_adapter=optimization.beta > 0.0,
+        distributed_context=distributed,
     )
     bundle = load_policy_and_build_grpo_trainer(
         policy_config,
         components,
         optimization,
         adapter_path=None if checkpoint is None else str(checkpoint),
+        distributed_context=distributed,
     )
     result = run_grpo_training(
         bundle,
@@ -118,13 +141,59 @@ def main() -> None:
             None if checkpoint is None else str(checkpoint)
         ),
     )
-    print(json.dumps(result.as_dict(), indent=2, sort_keys=True))
+    if distributed.is_main_process:
+        print(json.dumps(result.as_dict(), indent=2, sort_keys=True))
+
+
+def resolve_parallel_batch_settings(
+    *,
+    num_generations: int,
+    world_size: int,
+    steps_per_generation: int | None,
+    gradient_accumulation_steps: int | None,
+) -> tuple[int, int]:
+    """Derive one global GRPO group per optimizer step by default."""
+
+    if num_generations < 2:
+        raise ValueError("num_generations must be at least two")
+    if world_size <= 0:
+        raise ValueError("world_size must be positive")
+    if num_generations % world_size != 0:
+        raise ValueError(
+            "num_generations must be divisible by the selected GPU count: "
+            f"num_generations={num_generations}, world_size={world_size}"
+        )
+    local_group_size = num_generations // world_size
+    resolved_steps = (
+        local_group_size
+        if steps_per_generation is None
+        else int(steps_per_generation)
+    )
+    resolved_accumulation = (
+        local_group_size
+        if gradient_accumulation_steps is None
+        else int(gradient_accumulation_steps)
+    )
+    if resolved_steps != local_group_size:
+        raise ValueError(
+            "The first DDP-safe implementation requires exactly one global "
+            "GRPO group per generation buffer: expected "
+            f"steps_per_generation={local_group_size}, got {resolved_steps}"
+        )
+    if resolved_accumulation != local_group_size:
+        raise ValueError(
+            "The first DDP-safe implementation requires exactly one global "
+            "GRPO group per optimizer step: expected "
+            f"gradient_accumulation_steps={local_group_size}, got "
+            f"{resolved_accumulation}"
+        )
+    return resolved_steps, resolved_accumulation
 
 
 def build_parser() -> argparse.ArgumentParser:
     repo_root = NAV_SRC_DIR.parent
     parser = argparse.ArgumentParser(
-        description="Run single-GPU LoRA GRPO navigation training"
+        description="Run single-GPU or DDP LoRA GRPO navigation training"
     )
     parser.add_argument(
         "--annotation",
@@ -187,8 +256,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(repo_root / "outputs/grpo-stage6-first-run"),
     )
     parser.add_argument("--resume-from-checkpoint")
+    parser.add_argument(
+        "--distributed-mode",
+        choices=("auto", "single", "ddp"),
+        default="auto",
+        help="normally set by scripts/launch_grpo.py",
+    )
     parser.add_argument("--expected-instruction-count", type=int, default=14_039)
-    parser.add_argument("--clip-text-device", default="cuda:0")
+    parser.add_argument("--clip-text-device", default="auto")
     parser.add_argument(
         "--clip-text-dtype",
         choices=("fp32", "fp16", "bf16"),
@@ -206,8 +281,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--max-completion-length", type=int, required=True)
     parser.add_argument("--num-generations", type=int, default=4)
-    parser.add_argument("--steps-per-generation", type=int, default=4)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
+    parser.add_argument(
+        "--steps-per-generation",
+        type=int,
+        default=None,
+        help="auto: num_generations divided by world size",
+    )
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=None,
+        help="auto: num_generations divided by world size",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)

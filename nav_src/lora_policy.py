@@ -85,8 +85,8 @@ class LoRAPolicyConfig:
             raise ValueError("lora_dropout must be in [0, 1)")
         if self.dtype not in {"bf16", "fp16", "fp32"}:
             raise ValueError("dtype must be bf16, fp16, or fp32")
-        if self.device_map not in {"single", "cpu"}:
-            raise ValueError("device_map must be single or cpu")
+        if self.device_map not in {"single", "distributed", "cpu"}:
+            raise ValueError("device_map must be single, distributed, or cpu")
         if not str(self.expected_model_type).strip():
             raise ValueError("expected_model_type must be non-empty")
         if not 0.0 < float(self.max_trainable_percentage) <= 100.0:
@@ -327,20 +327,42 @@ def load_base_policy_model_and_tokenizer(
         "fp32": torch.float32,
     }[config.dtype]
     resolved_device_map: Any
-    if config.device_map == "single":
+    if config.device_map in {"single", "distributed"}:
         if not torch.cuda.is_available():
             raise LoRAPolicyError(
-                "device_map=single requires an available CUDA GPU"
+                f"device_map={config.device_map} requires an available CUDA GPU"
             )
         visible_devices = torch.cuda.device_count()
-        if visible_devices != 1:
+        if config.device_map == "single" and visible_devices != 1:
             raise LoRAPolicyError(
                 "device_map=single requires exactly one visible CUDA GPU; "
                 f"found {visible_devices}. Launch with CUDA_VISIBLE_DEVICES=<id>."
             )
+        if config.device_map == "distributed":
+            if (
+                not torch.distributed.is_available()
+                or not torch.distributed.is_initialized()
+            ):
+                raise LoRAPolicyError(
+                    "device_map=distributed requires an initialized torchrun "
+                    "process group"
+                )
+            world_size = int(torch.distributed.get_world_size())
+            local_rank = int(torch.cuda.current_device())
+            if world_size < 2 or visible_devices != world_size:
+                raise LoRAPolicyError(
+                    "Distributed policy loading requires one process per "
+                    f"visible GPU: world_size={world_size}, visible={visible_devices}"
+                )
+            if local_rank >= visible_devices:
+                raise LoRAPolicyError(
+                    f"Current CUDA device {local_rank} is not visible"
+                )
+        else:
+            local_rank = 0
         if config.dtype == "bf16" and not torch.cuda.is_bf16_supported():
             raise LoRAPolicyError("The visible GPU does not support BF16")
-        resolved_device_map = {"": 0}
+        resolved_device_map = {"": local_rank}
     else:
         resolved_device_map = {"": "cpu"}
 

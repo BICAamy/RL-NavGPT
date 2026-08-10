@@ -274,7 +274,7 @@ class FakeTrainerCallback:
 
 def run_manifest() -> dict[str, Any]:
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "run_type": "navgpt_trl_grpo_lora",
         "runtime": {
             "trl_version": "0.29.1",
@@ -282,7 +282,12 @@ def run_manifest() -> dict[str, Any]:
             "peft_version": "0.20.0",
         },
         "policy": {"r": 16},
-        "optimization": {"beta": 0.001},
+        "optimization": {
+            "beta": 0.001,
+            "distributed_mode": "single",
+            "world_size": 1,
+        },
+        "distributed": {"mode": "single", "world_size": 1},
         "environment": {"task_count": 2},
         "sources": {"annotation_sha256": "a" * 64},
     }
@@ -378,6 +383,37 @@ def validate_run_manifest_model_binding(root: Path) -> None:
         "Run manifest omitted the exact policy weight fingerprint",
     )
 
+    cloned_output = root / "manifest-output-clone"
+    cloned_paths = {
+        **component_config.paths.__dict__,
+        "output_dir": str(cloned_output),
+    }
+    cloned_components = SimpleNamespace(
+        config=GRPOComponentConfig(
+            **{
+                **component_config.__dict__,
+                "paths": StageSixPaths(**cloned_paths),
+            }
+        ),
+        task_records=components.task_records,
+    )
+    cloned_optimization = GRPOOptimizationConfig(
+        **{
+            **optimization.__dict__,
+            "output_dir": str(cloned_output),
+        }
+    )
+    cloned = build_grpo_run_manifest(
+        policy_config=policy_config,
+        components=cloned_components,
+        optimization=cloned_optimization,
+        runtime_contract=runtime_contract,
+    )
+    require(
+        first == cloned,
+        "Output directory incorrectly changed immutable run identity",
+    )
+
     policy_weights.write_bytes(b"policy-weights-version-two")
     second = build_grpo_run_manifest(
         policy_config=policy_config,
@@ -457,6 +493,16 @@ def validate_checkpoint_contract(root: Path) -> None:
         config=policy_config,
         target_report=FakeReport({"matched_module_count": 336}),
         parameter_report=FakeReport({"trainable_parameters": 68_812_800}),
+        model=SimpleNamespace(
+            named_parameters=lambda: [
+                (
+                    "lora_A.default.weight",
+                    __import__("torch").nn.Parameter(
+                        __import__("torch").ones(2, 2)
+                    ),
+                )
+            ]
+        ),
     )
     callback = make_grpo_checkpoint_callback(
         policy=policy,
@@ -539,7 +585,10 @@ def main() -> None:
     print("PASS stage-six logging and resume contract")
     print("- canonical reward unchanged; navigation metrics and compact traces logged")
     print("- run identity is bound to exact local Qwen Safetensors weights")
-    print("- LoRA/ref plus optimizer, scheduler, FP16 scaler, RNG, and Trainer state inventoried")
+    print(
+        "- LoRA/ref plus optimizer, scheduler, FP16 scaler, RNG, "
+        "and Trainer state inventoried"
+    )
     print("- incompatible or tampered checkpoints rejected before resume")
 
 
