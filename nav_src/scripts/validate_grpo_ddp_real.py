@@ -95,6 +95,7 @@ def _launch_command(
         "1",
         "--seed",
         str(args.seed),
+        "--full-determinism",
     ]
     if resume_from is not None:
         command.extend(["--resume-from-checkpoint", str(resume_from)])
@@ -363,6 +364,8 @@ def main() -> None:
     continuous = root / "continuous"
     resumed = root / "resumed"
     worker_environment = dict(os.environ)
+    worker_environment["PYTHONHASHSEED"] = str(args.seed)
+    worker_environment.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     worker_environment.setdefault("PYTHONNOUSERSITE", "1")
     worker_environment.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
 

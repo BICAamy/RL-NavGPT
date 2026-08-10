@@ -36,6 +36,14 @@ from lora_policy import LoRAPolicyConfig  # noqa: E402
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.full_determinism:
+        # This must run before DistributedContext creates a CUDA context.
+        # TrainingArguments repeats the setting later, but doing it here makes
+        # the cuBLAS workspace and deterministic-kernel policy effective while
+        # the policy and trainer are being constructed as well.
+        from transformers import enable_full_determinism
+
+        enable_full_determinism(args.seed)
     distributed = DistributedContext.initialize(args.distributed_mode)
     try:
         _run(args, distributed)
@@ -96,6 +104,7 @@ def _run(args: argparse.Namespace, distributed: DistributedContext) -> None:
         save_total_limit=args.save_total_limit,
         trajectory_log_interval=args.trajectory_log_interval,
         seed=args.seed,
+        full_determinism=args.full_determinism,
         distributed_mode=distributed.mode,
         world_size=distributed.world_size,
     )
@@ -311,6 +320,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-total-limit", type=int, default=3)
     parser.add_argument("--trajectory-log-interval", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--full-determinism",
+        action="store_true",
+        help=(
+            "enable slow deterministic CUDA/PyTorch algorithms; intended "
+            "for exact checkpoint-resume validation"
+        ),
+    )
     return parser
 
 

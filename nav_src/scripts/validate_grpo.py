@@ -149,6 +149,7 @@ class FakeGRPOConfig:
             "save_only_model",
             "seed",
             "data_seed",
+            "full_determinism",
             "report_to",
         }
         actual_base_kwargs = set(kwargs)
@@ -720,6 +721,20 @@ def validate_trainer_assembly(components: Any) -> None:
         output_dir="outputs/grpo",
         max_completion_length=1024,
     )
+    require(
+        optimization.full_determinism is False,
+        "Production optimization unexpectedly enabled full determinism",
+    )
+    try:
+        GRPOOptimizationConfig(
+            output_dir="outputs/grpo",
+            max_completion_length=1024,
+            full_determinism=1,  # type: ignore[arg-type]
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Non-boolean full_determinism was accepted")
     policy = fake_policy()
     policy_audit = validate_grpo_policy_bundle(policy)
     require(policy_audit["only_lora_trainable"], "Policy freeze audit failed")
@@ -779,6 +794,8 @@ def validate_trainer_assembly(components: Any) -> None:
             "First-run optimizer is not explicit")
     require(bundle.args.ddp_broadcast_buffers is False,
             "Frozen Qwen buffers would be broadcast by DDP")
+    require(bundle.args.full_determinism is False,
+            "Production trainer unexpectedly enabled full determinism")
     require(bundle.metrics_recorder is not None,
             "Navigation metrics recorder was not attached")
 

@@ -177,6 +177,7 @@ class GRPOOptimizationConfig:
     save_total_limit: int = 3
     trajectory_log_interval: int = 10
     seed: int = 0
+    full_determinism: bool = False
     distributed_mode: str = "single"
     world_size: int = 1
 
@@ -268,6 +269,8 @@ class GRPOOptimizationConfig:
             raise ValueError("num_train_epochs must be positive")
         if self.trajectory_log_interval < 0:
             raise ValueError("trajectory_log_interval must be nonnegative")
+        if not isinstance(self.full_determinism, bool):
+            raise ValueError("full_determinism must be a boolean")
 
     def require_token_budget(self) -> int:
         if self.max_completion_length is None:
@@ -927,6 +930,7 @@ def build_trl_grpo_config(
         "save_only_model": False,
         "seed": config.seed,
         "data_seed": config.seed,
+        "full_determinism": config.full_determinism,
         "report_to": "none",
     }
     config_parameters = inspect.signature(trl_module.GRPOConfig).parameters
