@@ -36,14 +36,11 @@ from lora_policy import LoRAPolicyConfig  # noqa: E402
 
 def main() -> None:
     args = build_parser().parse_args()
-    if args.full_determinism:
-        # This must run before DistributedContext creates a CUDA context.
-        # TrainingArguments repeats the setting later, but doing it here makes
-        # the cuBLAS workspace and deterministic-kernel policy effective while
-        # the policy and trainer are being constructed as well.
-        from transformers import enable_full_determinism
-
-        enable_full_determinism(args.seed)
+    # Do not call transformers.enable_full_determinism() here.  In DDP this
+    # process has not selected its local CUDA device yet, so the helper's
+    # torch.cuda.manual_seed_all() can initialize CUDA on the wrong device(s).
+    # GRPOConfig.full_determinism lets Trainer enable the same policy after the
+    # distributed runtime has bound this worker to LOCAL_RANK.
     distributed = DistributedContext.initialize(args.distributed_mode)
     try:
         _run(args, distributed)

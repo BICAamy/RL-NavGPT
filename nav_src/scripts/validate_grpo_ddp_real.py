@@ -30,6 +30,40 @@ def require(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+def _preflight_cuda(gpu_ids: list[str]) -> None:
+    """Fail once in the parent instead of spawning four CUDA-less workers."""
+    import torch
+
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "Real DDP validation requires a healthy CUDA runtime, but "
+            "torch.cuda.is_available() is False in the parent process "
+            f"(CUDA_VISIBLE_DEVICES={visible_devices!r}). Check the container "
+            "GPU runtime before launching validation."
+        )
+    device_count = torch.cuda.device_count()
+    try:
+        requested_devices = [int(item) for item in gpu_ids]
+    except ValueError as exc:
+        raise RuntimeError(
+            f"--gpus must contain numeric device IDs, got {gpu_ids!r}"
+        ) from exc
+    if any(device < 0 for device in requested_devices) or len(
+        set(requested_devices)
+    ) != len(requested_devices):
+        raise RuntimeError(
+            "--gpus must contain distinct, nonnegative device IDs, got "
+            f"{requested_devices!r}."
+        )
+    if device_count < len(requested_devices):
+        raise RuntimeError(
+            "Too few CUDA devices are visible to the validation parent: "
+            f"requested={requested_devices}, visible_count={device_count}, "
+            f"CUDA_VISIBLE_DEVICES={visible_devices!r}."
+        )
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     require(isinstance(value, dict), f"Expected JSON object: {path}")
@@ -358,6 +392,7 @@ def main() -> None:
         "Real stage-six DDP validation requires exactly four GPUs and "
         "num_generations=4",
     )
+    _preflight_cuda(gpu_ids)
     root = Path(args.validation_root).expanduser().resolve()
     require(not root.exists(), f"Validation root already exists: {root}")
     root.mkdir(parents=True)
