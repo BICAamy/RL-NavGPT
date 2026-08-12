@@ -530,7 +530,7 @@ def validate_launcher_contract() -> None:
         "DDP launcher did not create one worker per GPU",
     )
     train_script_index = ddp_command.index(
-        str(ROOT / "scripts/train_grpo.py")
+        str(NAV_SRC_DIR / "scripts/train_grpo.py")
     )
     require(
         ddp_command[train_script_index - 1] == "--",
@@ -557,7 +557,7 @@ def validate_launcher_contract() -> None:
         )
     )
     rank_script_index = rank_command.index(
-        str(ROOT / "scripts/train_grpo.py")
+        str(NAV_SRC_DIR / "scripts/train_grpo.py")
     )
     require(
         rank_command[rank_script_index - 1] == "--"
