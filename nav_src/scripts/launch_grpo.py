@@ -101,6 +101,11 @@ def build_launch_command(args: argparse.Namespace) -> tuple[list[str], dict[str,
             "torch.distributed.run",
             "--standalone",
             f"--nproc_per_node={len(devices)}",
+            # Stop torchrun's own argparse before the training script.  Without
+            # this separator, a short training option such as LoRA ``--r`` is
+            # treated as an ambiguous abbreviation of torchrun's --rdzv-*,
+            # --role, --run-path, or --redirects options.
+            "--",
             str(train_script),
             "--distributed-mode",
             "ddp",

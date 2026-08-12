@@ -529,10 +529,40 @@ def validate_launcher_contract() -> None:
         and "--nproc_per_node=4" in ddp_command,
         "DDP launcher did not create one worker per GPU",
     )
+    train_script_index = ddp_command.index(
+        str(ROOT / "scripts/train_grpo.py")
+    )
+    require(
+        ddp_command[train_script_index - 1] == "--",
+        "DDP launcher did not isolate training arguments from torchrun",
+    )
     require(
         ddp_command[-4:]
         == ["--distributed-mode", "ddp", "--max-completion-length", "32"],
         "DDP launcher forwarded the wrong training arguments",
+    )
+
+    rank_command, _ = build_launch_command(
+        argparse.Namespace(
+            mode="ddp",
+            gpus=[0, 1],
+            nccl_profile="default",
+            training_args=[
+                "--",
+                "--max-completion-length",
+                "32",
+                "--r",
+                "16",
+            ],
+        )
+    )
+    rank_script_index = rank_command.index(
+        str(ROOT / "scripts/train_grpo.py")
+    )
+    require(
+        rank_command[rank_script_index - 1] == "--"
+        and rank_command[-2:] == ["--r", "16"],
+        "DDP launcher exposed the LoRA --r option to torchrun",
     )
 
     safe_command, safe_environment = build_launch_command(
