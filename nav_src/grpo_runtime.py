@@ -456,6 +456,9 @@ def build_grpo_run_manifest(
         "distributed": {
             "mode": optimization.distributed_mode,
             "world_size": optimization.world_size,
+            "process_group_timeout_seconds": (
+                optimization.process_group_timeout_seconds
+            ),
         },
         "environment": {
             "task_count": len(components.task_records),

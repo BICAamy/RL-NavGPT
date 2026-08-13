@@ -180,6 +180,7 @@ class GRPOOptimizationConfig:
     full_determinism: bool = False
     distributed_mode: str = "single"
     world_size: int = 1
+    process_group_timeout_seconds: int = 7_200
 
     def __post_init__(self) -> None:
         if not str(self.output_dir).strip():
@@ -215,6 +216,14 @@ class GRPOOptimizationConfig:
             raise ValueError("single mode requires world_size=1")
         if self.distributed_mode == "ddp" and self.world_size < 2:
             raise ValueError("ddp mode requires world_size>=2")
+        if (
+            isinstance(self.process_group_timeout_seconds, bool)
+            or not isinstance(self.process_group_timeout_seconds, int)
+            or self.process_group_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "process_group_timeout_seconds must be a positive integer"
+            )
         generation_batch_size = (
             self.per_device_train_batch_size
             * self.steps_per_generation
@@ -1086,12 +1095,17 @@ def build_grpo_trainer(
     if (
         optimization.world_size != distributed_context.world_size
         or optimization.distributed_mode != distributed_context.mode
+        or optimization.process_group_timeout_seconds
+        != distributed_context.process_group_timeout_seconds
     ):
         raise ValueError(
             "GRPO optimization topology differs from the active process "
             f"context: optimization={optimization.distributed_mode}/"
-            f"{optimization.world_size}, context={distributed_context.mode}/"
-            f"{distributed_context.world_size}"
+            f"{optimization.world_size}/"
+            f"{optimization.process_group_timeout_seconds}s, "
+            f"context={distributed_context.mode}/"
+            f"{distributed_context.world_size}/"
+            f"{distributed_context.process_group_timeout_seconds}s"
         )
     configured_world_size = int(
         getattr(args, "world_size", optimization.world_size)

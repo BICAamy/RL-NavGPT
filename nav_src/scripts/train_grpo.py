@@ -17,7 +17,10 @@ NAV_SRC_DIR = Path(__file__).resolve().parents[1]
 if str(NAV_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(NAV_SRC_DIR))
 
-from distributed_runtime import DistributedContext  # noqa: E402
+from distributed_runtime import (  # noqa: E402
+    DEFAULT_PROCESS_GROUP_TIMEOUT_SECONDS,
+    DistributedContext,
+)
 from grpo_runtime import (  # noqa: E402
     build_grpo_run_manifest,
     prepare_grpo_run,
@@ -47,7 +50,10 @@ def main() -> None:
     # torch.cuda.manual_seed_all() can initialize CUDA on the wrong device(s).
     # GRPOConfig.full_determinism lets Trainer enable the same policy after the
     # distributed runtime has bound this worker to LOCAL_RANK.
-    distributed = DistributedContext.initialize(args.distributed_mode)
+    distributed = DistributedContext.initialize(
+        args.distributed_mode,
+        process_group_timeout_seconds=args.process_group_timeout_seconds,
+    )
     try:
         _run(args, distributed)
     finally:
@@ -117,6 +123,7 @@ def _run(args: argparse.Namespace, distributed: DistributedContext) -> None:
         full_determinism=args.full_determinism,
         distributed_mode=distributed.mode,
         world_size=distributed.world_size,
+        process_group_timeout_seconds=args.process_group_timeout_seconds,
     )
     policy_config = LoRAPolicyConfig(
         model_path=args.policy_model_path,
@@ -367,6 +374,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "single", "ddp"),
         default="auto",
         help="normally set by scripts/launch_grpo.py",
+    )
+    parser.add_argument(
+        "--process-group-timeout-seconds",
+        type=int,
+        default=DEFAULT_PROCESS_GROUP_TIMEOUT_SECONDS,
+        help=(
+            "finite timeout for DDP collectives; the 7200-second production "
+            "default accommodates data-dependent navigation generation skew"
+        ),
     )
     parser.add_argument("--expected-instruction-count", type=int, default=14_039)
     parser.add_argument("--clip-text-device", default="auto")

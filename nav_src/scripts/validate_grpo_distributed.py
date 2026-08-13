@@ -18,9 +18,12 @@ if str(NAV_SRC_DIR) not in sys.path:
 
 from action_plan_cache import canonical_json, sha256_text  # noqa: E402
 from distributed_runtime import (  # noqa: E402
+    DEFAULT_PROCESS_GROUP_TIMEOUT_SECONDS,
+    DistributedConfigurationError,
     DistributedContext,
     configure_trainable_only_ddp,
     disable_redundant_ddp_initial_sync,
+    resolve_process_group_timeout,
     single_process_context,
 )
 from grpo_runtime import (  # noqa: E402
@@ -416,6 +419,23 @@ def _worker(
 
 def validate_batch_derivation() -> None:
     require(
+        resolve_process_group_timeout(
+            DEFAULT_PROCESS_GROUP_TIMEOUT_SECONDS
+        ).total_seconds()
+        == 7_200,
+        "Production DDP timeout changed",
+    )
+    for invalid_timeout in (True, 0, -1, 1.5, "7200"):
+        try:
+            resolve_process_group_timeout(invalid_timeout)  # type: ignore[arg-type]
+        except DistributedConfigurationError:
+            pass
+        else:
+            raise AssertionError(
+                f"Invalid process-group timeout was accepted: {invalid_timeout!r}"
+            )
+
+    require(
         resolve_parallel_batch_settings(
             num_generations=4,
             world_size=1,
@@ -465,6 +485,7 @@ def validate_batch_derivation() -> None:
         steps_per_generation=1,
         distributed_mode="ddp",
         world_size=4,
+        process_group_timeout_seconds=7_200,
     )
     for bad_world_size in (True, 0, 3, "4"):
         try:

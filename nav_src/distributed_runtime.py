@@ -10,9 +10,13 @@ initializing ``torch.distributed``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 import inspect
 import os
 from typing import Any, Callable, List, Optional
+
+
+DEFAULT_PROCESS_GROUP_TIMEOUT_SECONDS = 7_200
 
 
 class DistributedConfigurationError(RuntimeError):
@@ -226,6 +230,24 @@ def _environment_integer(name: str, default: int) -> int:
     return value
 
 
+def resolve_process_group_timeout(seconds: int) -> timedelta:
+    """Validate and materialize the timeout shared by all DDP collectives.
+
+    PyTorch's NCCL default is ten minutes.  Navigation rollout generation is
+    intentionally data-dependent, so one rank can legitimately spend longer
+    than that on a long completion while another rank waits at a small
+    metadata collective.  Keep a finite two-hour production default so real
+    hangs still fail, but ordinary rollout skew does not abort the run.
+    """
+
+    if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds <= 0:
+        raise DistributedConfigurationError(
+            "process_group_timeout_seconds must be a positive integer, got "
+            f"{seconds!r}"
+        )
+    return timedelta(seconds=seconds)
+
+
 @dataclass
 class DistributedContext:
     """Process topology and the minimal collectives used by stage six."""
@@ -237,6 +259,7 @@ class DistributedContext:
     backend: Optional[str] = None
     initialized_here: bool = False
     _torch: Optional[Any] = None
+    process_group_timeout_seconds: int = DEFAULT_PROCESS_GROUP_TIMEOUT_SECONDS
 
     @property
     def is_distributed(self) -> bool:
@@ -252,14 +275,25 @@ class DistributedContext:
             "mode": self.mode,
             "world_size": self.world_size,
             "backend": self.backend,
+            "process_group_timeout_seconds": self.process_group_timeout_seconds,
         }
 
     @classmethod
-    def initialize(cls, requested_mode: str = "auto") -> "DistributedContext":
+    def initialize(
+        cls,
+        requested_mode: str = "auto",
+        *,
+        process_group_timeout_seconds: int = (
+            DEFAULT_PROCESS_GROUP_TIMEOUT_SECONDS
+        ),
+    ) -> "DistributedContext":
         """Initialize a single-GPU or NCCL DDP context from launcher env vars."""
 
         if requested_mode not in {"auto", "single", "ddp"}:
             raise ValueError("requested_mode must be auto, single, or ddp")
+        process_group_timeout = resolve_process_group_timeout(
+            process_group_timeout_seconds
+        )
         world_size = _environment_integer("WORLD_SIZE", 1)
         rank = _environment_integer("RANK", 0)
         local_rank = _environment_integer("LOCAL_RANK", 0)
@@ -277,6 +311,7 @@ class DistributedContext:
                 rank=0,
                 local_rank=0,
                 world_size=1,
+                process_group_timeout_seconds=process_group_timeout_seconds,
             )
 
         if world_size < 2:
@@ -319,6 +354,7 @@ class DistributedContext:
                 init_method="env://",
                 rank=rank,
                 world_size=world_size,
+                timeout=process_group_timeout,
             )
             initialized_here = True
         actual_rank = int(torch.distributed.get_rank())
@@ -337,6 +373,7 @@ class DistributedContext:
             backend=str(torch.distributed.get_backend()),
             initialized_here=initialized_here,
             _torch=torch,
+            process_group_timeout_seconds=process_group_timeout_seconds,
         )
 
     def barrier(self) -> None:
