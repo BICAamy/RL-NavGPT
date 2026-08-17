@@ -17,9 +17,11 @@ if str(NAV_SRC_DIR) not in sys.path:
 from action_plan_cache import canonical_json, sha256_text  # noqa: E402
 from grpo_runtime import (  # noqa: E402
     CHECKPOINT_MANIFEST_NAME,
+    IMPLEMENTATION_PATCH_LEDGER_NAME,
     RUN_MANIFEST_NAME,
     NavigationMetricsRecorder,
     build_grpo_run_manifest,
+    load_grpo_run_manifest,
     make_grpo_checkpoint_callback,
     make_recording_environment_reward,
     navigation_grpo_trainer_class,
@@ -289,7 +291,10 @@ def run_manifest() -> dict[str, Any]:
         },
         "distributed": {"mode": "single", "world_size": 1},
         "environment": {"task_count": 2},
-        "sources": {"annotation_sha256": "a" * 64},
+        "sources": {
+            "annotation_sha256": "a" * 64,
+            "implementation_sha256": "b" * 64,
+        },
     }
     manifest["run_fingerprint"] = sha256_text(canonical_json(manifest))
     return manifest
@@ -539,6 +544,96 @@ def validate_checkpoint_contract(root: Path) -> None:
     )
     require(resumed == checkpoint.resolve(), "Resume preparation changed path")
 
+    patched_manifest = json.loads(canonical_json(manifest))
+    patched_manifest["sources"]["implementation_sha256"] = "c" * 64
+    patched_manifest["run_fingerprint"] = sha256_text(
+        canonical_json(
+            {
+                name: value
+                for name, value in patched_manifest.items()
+                if name != "run_fingerprint"
+            }
+        )
+    )
+    try:
+        prepare_grpo_run(
+            patched_manifest,
+            output_dir=str(output),
+            resume_from_checkpoint=str(checkpoint),
+            policy_config=policy_config,
+            require_reference_adapter=True,
+        )
+    except Exception as exc:
+        require(
+            "implementation-patch-reason" in str(exc),
+            "Implementation-only resume rejection was unclear",
+        )
+    else:
+        raise AssertionError("Unapproved implementation patch was accepted")
+
+    patched_resume = prepare_grpo_run(
+        patched_manifest,
+        output_dir=str(output),
+        resume_from_checkpoint=str(checkpoint),
+        policy_config=policy_config,
+        require_reference_adapter=True,
+        resume_implementation_patch_reason="test resume synchronization fix",
+    )
+    require(
+        patched_resume == checkpoint.resolve(),
+        "Approved implementation-only recovery changed checkpoint path",
+    )
+    require(
+        load_grpo_run_manifest(str(output)) == manifest,
+        "Implementation recovery rewrote the original run identity",
+    )
+    ledger = json.loads(
+        (output / IMPLEMENTATION_PATCH_LEDGER_NAME).read_text(encoding="utf-8")
+    )
+    require(
+        len(ledger["patches"]) == 1
+        and ledger["patches"][0]["active_implementation_sha256"]
+        == "c" * 64,
+        "Implementation recovery ledger is incomplete",
+    )
+    # Once this exact patch hash is recorded, restarting it is idempotent and
+    # does not require weakening the manifest contract a second time.
+    prepare_grpo_run(
+        patched_manifest,
+        output_dir=str(output),
+        resume_from_checkpoint=str(checkpoint),
+        policy_config=policy_config,
+        require_reference_adapter=True,
+    )
+
+    unsafe_manifest = json.loads(canonical_json(patched_manifest))
+    unsafe_manifest["optimization"]["beta"] = 0.5
+    unsafe_manifest["run_fingerprint"] = sha256_text(
+        canonical_json(
+            {
+                name: value
+                for name, value in unsafe_manifest.items()
+                if name != "run_fingerprint"
+            }
+        )
+    )
+    try:
+        prepare_grpo_run(
+            unsafe_manifest,
+            output_dir=str(output),
+            resume_from_checkpoint=str(checkpoint),
+            policy_config=policy_config,
+            require_reference_adapter=True,
+            resume_implementation_patch_reason="must remain rejected",
+        )
+    except Exception as exc:
+        require(
+            "cannot authorize" in str(exc),
+            "Unsafe resume mismatch produced the wrong rejection",
+        )
+    else:
+        raise AssertionError("Implementation patch authorized beta drift")
+
     scaler_path = checkpoint / "scaler.pt"
     scaler_bytes = scaler_path.read_bytes()
     scaler_path.write_bytes(b"tampered-scaler")
@@ -589,6 +684,7 @@ def main() -> None:
         "- LoRA/ref plus optimizer, scheduler, FP16 scaler, RNG, "
         "and Trainer state inventoried"
     )
+    print("- implementation-only recovery requires an audited patch ledger")
     print("- incompatible or tampered checkpoints rejected before resume")
 
 

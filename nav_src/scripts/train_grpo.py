@@ -23,6 +23,7 @@ from distributed_runtime import (  # noqa: E402
 )
 from grpo_runtime import (  # noqa: E402
     build_grpo_run_manifest,
+    load_grpo_run_manifest,
     prepare_grpo_run,
     run_grpo_training,
 )
@@ -170,7 +171,17 @@ def _run(args: argparse.Namespace, distributed: DistributedContext) -> None:
         policy_config=policy_config,
         require_reference_adapter=optimization.beta > 0.0,
         distributed_context=distributed,
+        resume_implementation_patch_reason=(
+            args.resume_implementation_patch_reason
+        ),
     )
+    # Keep the original root manifest as the scientific run identity. An
+    # authorized implementation-only recovery is recorded separately and must
+    # not silently rewrite existing validation/checkpoint identities.
+    if checkpoint is not None:
+        run_manifest = distributed.call_on_main_and_broadcast(
+            lambda: load_grpo_run_manifest(args.output_dir)
+        )
     bundle = load_policy_and_build_grpo_trainer(
         policy_config,
         components,
@@ -361,6 +372,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(repo_root / "outputs/grpo-stage6-first-run"),
     )
     parser.add_argument("--resume-from-checkpoint")
+    parser.add_argument(
+        "--resume-implementation-patch-reason",
+        help=(
+            "explicitly authorize an implementation-only checkpoint recovery; "
+            "all model/data/reward/optimization/topology fields must still match"
+        ),
+    )
     parser.add_argument(
         "--validation-only",
         action="store_true",

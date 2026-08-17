@@ -30,7 +30,10 @@ from grpo_runtime import (  # noqa: E402
     CHECKPOINT_MANIFEST_NAME,
     NavigationMetricsRecorder,
     _audit_trainable_parameter_sync,
+    _fingerprint_trainable_parameters,
+    _synchronize_resumed_trainable_parameters_from_main,
     make_grpo_checkpoint_callback,
+    make_grpo_resume_parameter_sync_callback,
     validate_grpo_checkpoint,
 )
 from grpo_training import GRPOOptimizationConfig  # noqa: E402
@@ -371,13 +374,24 @@ def _worker(
         )
     context.barrier()
 
+    divergent_parameter = torch.nn.Parameter(
+        torch.full((2, 2), float(rank))
+    )
+    divergent_reference_parameter = torch.nn.Parameter(
+        torch.full((2, 2), float(rank + 10)),
+        requires_grad=False,
+    )
     divergent_policy = SimpleNamespace(
         model=SimpleNamespace(
             named_parameters=lambda: [
                 (
                     "lora_A.default.weight",
-                    torch.nn.Parameter(torch.full((2, 2), float(rank))),
-                )
+                    divergent_parameter,
+                ),
+                (
+                    "lora_A.ref.weight",
+                    divergent_reference_parameter,
+                ),
             ]
         )
     )
@@ -390,6 +404,76 @@ def _worker(
         )
     else:
         raise AssertionError("Diverged LoRA parameters were accepted")
+
+    expected_resume_sha256 = context.broadcast_object(
+        _fingerprint_trainable_parameters(divergent_policy)
+        if rank == 0
+        else None
+    )
+    resume_sync = _synchronize_resumed_trainable_parameters_from_main(
+        divergent_policy,
+        context,
+        expected_sha256=str(expected_resume_sha256),
+    )
+    require(
+        resume_sync["synchronized"] is True,
+        "Diverged resumed LoRA tensors were not synchronized",
+    )
+    require(
+        len(set(resume_sync["before_sha256"])) == world_size,
+        "Resume synchronization did not preserve the pre-sync audit",
+    )
+    require(
+        resume_sync["after_sha256"] == expected_resume_sha256,
+        "Resume synchronization did not retain the checkpoint digest",
+    )
+    require(
+        float(divergent_parameter[0, 0].detach()) == 0.0,
+        "Resume synchronization did not copy rank-zero LoRA bytes",
+    )
+
+    # Simulate Trainer's later internal checkpoint load leaving a worker rank
+    # at the wrong value.  on_train_begin must restore the invariant again,
+    # before any resumed forward/backward step is allowed to run.
+    if rank != 0:
+        with torch.no_grad():
+            divergent_parameter.fill_(3.0)
+    post_load_callback = make_grpo_resume_parameter_sync_callback(
+        policy=divergent_policy,
+        expected_sha256=str(expected_resume_sha256),
+        transformers_module=SimpleNamespace(
+            TrainerCallback=FakeTrainerCallback
+        ),
+        distributed_context=context,
+        require_reference_adapter=True,
+    )
+    control = SimpleNamespace()
+    require(
+        post_load_callback.on_train_begin(
+            SimpleNamespace(),
+            SimpleNamespace(),
+            control,
+        )
+        is control,
+        "Post-load resume callback did not preserve Trainer control",
+    )
+    require(
+        post_load_callback.last_report["synchronized"] is True,
+        "Post-load resumed LoRA divergence was not synchronized",
+    )
+    require(
+        _fingerprint_trainable_parameters(divergent_policy)
+        == expected_resume_sha256,
+        "Post-load resumed LoRA does not match the checkpoint",
+    )
+    require(
+        post_load_callback.last_reference_report["synchronized"] is True,
+        "Post-load reference LoRA divergence was not synchronized",
+    )
+    require(
+        float(divergent_reference_parameter[0, 0].detach()) == 10.0,
+        "Post-load reference LoRA did not copy rank-zero bytes",
+    )
 
     if rank == 0:
         rng_path = checkpoint / "rng_state_1.pth"
@@ -727,6 +811,7 @@ def main() -> None:
     print("- launcher and 1/2/4-GPU batches preserve one complete GRPO group")
     print("- two real Gloo ranks produced one ordered, rank-zero-owned rollout log")
     print("- DDP checkpoints require all-rank RNG and synchronized LoRA tensors")
+    print("- resumed LoRA is checkpoint-anchored before and after Trainer restore")
     print("- audited identical LoRA state skips redundant DDP initialization sync")
     print("- frozen Qwen state is ignored while LoRA gradient reduction remains active")
 

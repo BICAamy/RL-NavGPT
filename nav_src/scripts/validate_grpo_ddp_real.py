@@ -280,6 +280,16 @@ def _compare_branches(
         resumed_checkpoint / "adapter_model.safetensors",
         require_identical=True,
     )
+    reference_adapter = _compare_safetensors(
+        continuous_checkpoint / "ref/adapter_model.safetensors",
+        resumed_checkpoint / "ref/adapter_model.safetensors",
+        require_identical=True,
+    )
+    frozen_reference = _compare_safetensors(
+        continuous / "checkpoint-1/ref/adapter_model.safetensors",
+        resumed_checkpoint / "ref/adapter_model.safetensors",
+        require_identical=True,
+    )
     update = _compare_safetensors(
         continuous / "checkpoint-1/adapter_model.safetensors",
         continuous_checkpoint / "adapter_model.safetensors",
@@ -353,6 +363,8 @@ def _compare_branches(
         )
     return {
         "adapter_comparison": adapter,
+        "reference_adapter_comparison": reference_adapter,
+        "frozen_reference_comparison": frozen_reference,
         "training_update_max_abs_difference": update["max_abs_difference"],
         "trainable_parameter_sha256": continuous_metadata[
             "trainable_parameter_sha256"
@@ -445,7 +457,10 @@ def main() -> None:
     print("PASS real stage-six DDP validation")
     print("- four GPUs produced one same-task GRPO group per optimizer step")
     print("- uninterrupted step 2 equals checkpoint-1 resume to step 2")
-    print("- LoRA/optimizer/scheduler/all-rank RNG/rollouts are identical")
+    print(
+        "- policy/reference LoRA, optimizer, scheduler, all-rank RNG, and "
+        "rollouts are identical"
+    )
     print(f"- report={report_path}")
 
 

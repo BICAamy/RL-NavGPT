@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import statistics
 import threading
 from typing import Any, Dict, List, Mapping, Optional, Sequence
@@ -31,6 +32,7 @@ CHECKPOINT_MANIFEST_SCHEMA_VERSION = 2
 ROLLOUT_LOG_NAME = "navigation_rollouts.jsonl"
 TRAIN_LOG_NAME = "train_metrics.jsonl"
 SESSION_LOG_NAME = "training_sessions.jsonl"
+IMPLEMENTATION_PATCH_LEDGER_NAME = "navgpt_grpo_implementation_patches.json"
 
 
 class GRPORuntimeError(RuntimeError):
@@ -488,6 +490,7 @@ def prepare_grpo_run(
     policy_config: Any,
     require_reference_adapter: bool,
     distributed_context: Optional[Any] = None,
+    resume_implementation_patch_reason: Optional[str] = None,
 ) -> Optional[Path]:
     """Initialize a new output directory or validate an exact resume point."""
 
@@ -503,6 +506,9 @@ def prepare_grpo_run(
             resume_from_checkpoint=resume_from_checkpoint,
             policy_config=policy_config,
             require_reference_adapter=require_reference_adapter,
+            resume_implementation_patch_reason=(
+                resume_implementation_patch_reason
+            ),
         )
     )
     return None if result is None else Path(result)
@@ -515,12 +521,18 @@ def _prepare_grpo_run_local(
     resume_from_checkpoint: Optional[str],
     policy_config: Any,
     require_reference_adapter: bool,
+    resume_implementation_patch_reason: Optional[str],
 ) -> Optional[str]:
     """Rank-zero implementation for :func:`prepare_grpo_run`."""
 
     output = Path(output_dir).expanduser().resolve()
     _validate_run_manifest(manifest)
     if resume_from_checkpoint is None:
+        if resume_implementation_patch_reason is not None:
+            raise GRPORuntimeError(
+                "An implementation patch reason is valid only for checkpoint "
+                "resume"
+            )
         existing = list(output.iterdir()) if output.exists() else []
         if existing:
             if existing == [output / RUN_MANIFEST_NAME]:
@@ -544,17 +556,142 @@ def _prepare_grpo_run_local(
     root_manifest = _read_json(output / RUN_MANIFEST_NAME)
     _validate_run_manifest(root_manifest)
     if canonical_json(root_manifest) != canonical_json(manifest):
-        raise GRPORuntimeError(
-            "Resume configuration or immutable training inputs differ from "
-            "the original run manifest"
+        _authorize_resume_implementation_patch(
+            output=output,
+            checkpoint=checkpoint,
+            recorded_manifest=root_manifest,
+            active_manifest=manifest,
+            reason=resume_implementation_patch_reason,
         )
     validate_grpo_checkpoint(
         str(checkpoint),
         policy_config=policy_config,
-        expected_run_manifest=manifest,
+        expected_run_manifest=root_manifest,
         require_reference_adapter=require_reference_adapter,
     )
     return str(checkpoint)
+
+
+def load_grpo_run_manifest(output_dir: str) -> Dict[str, Any]:
+    """Load the immutable run identity after resume preflight succeeds."""
+
+    output = Path(output_dir).expanduser().resolve()
+    manifest = _read_json(output / RUN_MANIFEST_NAME)
+    _validate_run_manifest(manifest)
+    return manifest
+
+
+def _authorize_resume_implementation_patch(
+    *,
+    output: Path,
+    checkpoint: Path,
+    recorded_manifest: Mapping[str, Any],
+    active_manifest: Mapping[str, Any],
+    reason: Optional[str],
+) -> None:
+    """Allow and record only a deliberate implementation-only resume patch."""
+
+    checkpoint_match = re.fullmatch(r"checkpoint-(\d+)", checkpoint.name)
+    if checkpoint_match is None:
+        raise GRPORuntimeError(
+            f"Invalid Trainer checkpoint directory name: {checkpoint.name}"
+        )
+    recorded_hash = _implementation_sha256(recorded_manifest)
+    active_hash = _implementation_sha256(active_manifest)
+    if canonical_json(_without_implementation_identity(recorded_manifest)) != (
+        canonical_json(_without_implementation_identity(active_manifest))
+    ):
+        raise GRPORuntimeError(
+            "Resume configuration or immutable training inputs differ from "
+            "the original run manifest; the implementation-patch escape "
+            "hatch cannot authorize model, data, reward, optimization, or "
+            "distributed-topology changes"
+        )
+
+    ledger_path = output / IMPLEMENTATION_PATCH_LEDGER_NAME
+    ledger = _read_implementation_patch_ledger(
+        ledger_path,
+        recorded_run_fingerprint=str(recorded_manifest["run_fingerprint"]),
+    )
+    previously_authorized = any(
+        str(row.get("active_implementation_sha256")) == active_hash
+        for row in ledger["patches"]
+    )
+    if previously_authorized:
+        return
+
+    normalized_reason = "" if reason is None else str(reason).strip()
+    if len(normalized_reason) < 8:
+        raise GRPORuntimeError(
+            "Resume changes only implementation code. Re-run with an explicit "
+            "--resume-implementation-patch-reason (at least 8 characters) "
+            "after reviewing the patch"
+        )
+    ledger["patches"].append(
+        {
+            "schema_version": 1,
+            "checkpoint": checkpoint.name,
+            "global_step": int(checkpoint_match.group(1)),
+            "recorded_run_fingerprint": str(
+                recorded_manifest["run_fingerprint"]
+            ),
+            "recorded_implementation_sha256": recorded_hash,
+            "active_run_fingerprint": str(active_manifest["run_fingerprint"]),
+            "active_implementation_sha256": active_hash,
+            "reason": normalized_reason,
+        }
+    )
+    _write_json_atomic(ledger_path, ledger, exclusive=False)
+
+
+def _implementation_sha256(manifest: Mapping[str, Any]) -> str:
+    sources = manifest.get("sources")
+    value = (
+        sources.get("implementation_sha256")
+        if isinstance(sources, Mapping)
+        else None
+    )
+    if re.fullmatch(r"[0-9a-f]{64}", str(value)) is None:
+        raise GRPORuntimeError(
+            "Run manifest has no valid implementation_sha256"
+        )
+    return str(value)
+
+
+def _without_implementation_identity(
+    manifest: Mapping[str, Any],
+) -> Dict[str, Any]:
+    value = json.loads(canonical_json(manifest))
+    value.pop("run_fingerprint", None)
+    sources = value.get("sources")
+    if not isinstance(sources, dict):
+        raise GRPORuntimeError("Run manifest has no sources mapping")
+    sources.pop("implementation_sha256", None)
+    return value
+
+
+def _read_implementation_patch_ledger(
+    path: Path,
+    *,
+    recorded_run_fingerprint: str,
+) -> Dict[str, Any]:
+    if not path.exists():
+        return {
+            "schema_version": 1,
+            "recorded_run_fingerprint": recorded_run_fingerprint,
+            "patches": [],
+        }
+    ledger = _read_json(path)
+    if (
+        ledger.get("schema_version") != 1
+        or ledger.get("recorded_run_fingerprint")
+        != recorded_run_fingerprint
+        or not isinstance(ledger.get("patches"), list)
+    ):
+        raise GRPORuntimeError(
+            f"Invalid implementation patch ledger: {path}"
+        )
+    return ledger
 
 
 def make_grpo_checkpoint_callback(
@@ -597,6 +734,71 @@ def make_grpo_checkpoint_callback(
             return control
 
     return NavGPTCheckpointCallback()
+
+
+def make_grpo_resume_parameter_sync_callback(
+    *,
+    policy: Any,
+    expected_sha256: str,
+    transformers_module: Any,
+    distributed_context: Any,
+    require_reference_adapter: bool,
+) -> Any:
+    """Reassert the checkpoint LoRA state after Trainer restores its state.
+
+    ``Trainer.train(resume_from_checkpoint=...)`` performs another model load
+    after the policy bundle has been assembled.  Consequently the pre-Trainer
+    audit in :func:`run_grpo_training` is necessary but not sufficient on PEFT
+    versions that restore only rank zero and expect DDP initialization to copy
+    the adapter.  This callback runs after that internal restore and before the
+    first optimization step.
+    """
+
+    callback_base = getattr(transformers_module, "TrainerCallback", object)
+
+    class NavGPTResumeParameterSyncCallback(callback_base):
+        last_report: Optional[Dict[str, Any]] = None
+        last_reference_report: Optional[Dict[str, Any]] = None
+
+        def on_train_begin(
+            self,
+            args: Any,
+            state: Any,
+            control: Any,
+            **_: Any,
+        ) -> Any:
+            del args, state
+            self.last_report = (
+                _synchronize_resumed_trainable_parameters_from_main(
+                    policy,
+                    distributed_context,
+                    expected_sha256=expected_sha256,
+                )
+            )
+            if require_reference_adapter:
+                self.last_reference_report = (
+                    _synchronize_resumed_reference_parameters_from_main(
+                        policy,
+                        distributed_context,
+                    )
+                )
+            if distributed_context.is_main_process:
+                reference_sha256 = (
+                    None
+                    if self.last_reference_report is None
+                    else self.last_reference_report["after_sha256"]
+                )
+                print(
+                    "DDP resume post-load LoRA sync: "
+                    f"synchronized={self.last_report['synchronized']} "
+                    f"tensors={self.last_report['tensor_count']} "
+                    f"sha256={self.last_report['after_sha256']} "
+                    f"reference_sha256={reference_sha256}",
+                    flush=True,
+                )
+            return control
+
+    return NavGPTResumeParameterSyncCallback()
 
 
 def validate_grpo_checkpoint(
@@ -710,6 +912,8 @@ def validate_grpo_checkpoint(
         expected_inventory.update(
             {"ref/adapter_config.json", "ref/adapter_model.safetensors"}
         )
+    if (checkpoint / IMPLEMENTATION_PATCH_LEDGER_NAME).is_file():
+        expected_inventory.add(IMPLEMENTATION_PATCH_LEDGER_NAME)
     missing_inventory = expected_inventory.difference(str(name) for name in files)
     if missing_inventory:
         raise GRPORuntimeError(
@@ -754,15 +958,38 @@ def run_grpo_training(
         distributed_context,
     )
     initial_parameter_sha256 = None
+    resume_parameter_sync = None
+    expected_resume_sha256 = None
     if distributed_context.is_distributed:
-        # DDP init_sync normally broadcasts all trainable parameters in a fixed
-        # 250-MiB bucket.  This server's NCCL SHM transport fails on that bucket,
-        # so prove exact LoRA equality first and then omit only the redundant
-        # initialization broadcast.  Backward gradient AllReduce is unchanged.
-        initial_parameter_sha256 = _audit_trainable_parameter_sync(
-            bundle.policy,
-            distributed_context,
-        )
+        if resume_from_checkpoint is None:
+            # Fresh ranks initialize LoRA from the same audited seed.  Prove
+            # equality before omitting DDP's redundant aggregate broadcast.
+            initial_parameter_sha256 = _audit_trainable_parameter_sync(
+                bundle.policy,
+                distributed_context,
+            )
+        else:
+            # PEFT/Trainer checkpoint loading may materialize the restored
+            # adapter only on rank zero and rely on DDP's initial broadcast.
+            # This project intentionally disables that large aggregate
+            # broadcast on the validated Blackwell transport path.  Anchor
+            # rank zero to the checkpoint manifest, then synchronize only the
+            # small trainable LoRA tensors one at a time before the usual
+            # byte-exact audit.  Frozen Qwen parameters remain untouched.
+            expected_resume_sha256 = _checkpoint_trainable_parameter_sha256(
+                resume_from_checkpoint,
+                distributed_context,
+            )
+            resume_parameter_sync = (
+                _synchronize_resumed_trainable_parameters_from_main(
+                    bundle.policy,
+                    distributed_context,
+                    expected_sha256=expected_resume_sha256,
+                )
+            )
+            initial_parameter_sha256 = str(
+                resume_parameter_sync["after_sha256"]
+            )
         ddp_boundary["init_sync"] = not disable_redundant_ddp_initial_sync(
             bundle.trainer.accelerator,
             distributed_context,
@@ -770,6 +997,7 @@ def run_grpo_training(
     ddp_boundary["initial_trainable_parameter_sha256"] = (
         initial_parameter_sha256
     )
+    ddp_boundary["resume_parameter_sync"] = resume_parameter_sync
     # Preserve the audited boundary for validation/debugging without changing
     # Transformers' checkpoint schema.
     bundle.trainer.navgpt_ddp_parameter_boundary = dict(ddp_boundary)
@@ -781,6 +1009,8 @@ def run_grpo_training(
             f"{ddp_boundary['ignored_frozen_parameter_count']} "
             f"ignored_buffers={ddp_boundary['ignored_buffer_count']} "
             f"init_sync={ddp_boundary['init_sync']} "
+            f"resume_sync="
+            f"{None if resume_parameter_sync is None else resume_parameter_sync['synchronized']} "
             f"initial_sha256={initial_parameter_sha256}",
             flush=True,
         )
@@ -792,6 +1022,18 @@ def run_grpo_training(
         distributed_context=distributed_context,
     )
     bundle.trainer.add_callback(checkpoint_callback)
+    if expected_resume_sha256 is not None:
+        # Trainer performs its own checkpoint model load inside ``train``.
+        # Recheck at on_train_begin so no rank can enter the first forward pass
+        # with an initial adapter after that second load.
+        resume_sync_callback = make_grpo_resume_parameter_sync_callback(
+            policy=bundle.policy,
+            expected_sha256=expected_resume_sha256,
+            transformers_module=transformers_module,
+            distributed_context=distributed_context,
+            require_reference_adapter=float(bundle.args.beta) > 0.0,
+        )
+        bundle.trainer.add_callback(resume_sync_callback)
     if validation_manager is not None:
         from grpo_validation import make_grpo_validation_callback
 
@@ -836,6 +1078,15 @@ def run_grpo_training(
                 f"Final adapter destination already exists: {final_adapter}"
             )
         bundle.trainer.save_model(str(final_adapter))
+        patch_ledger = (
+            Path(bundle.args.output_dir).expanduser().resolve()
+            / IMPLEMENTATION_PATCH_LEDGER_NAME
+        )
+        if patch_ledger.is_file():
+            shutil.copy2(
+                patch_ledger,
+                final_adapter / IMPLEMENTATION_PATCH_LEDGER_NAME,
+            )
         from lora_policy import write_lora_adapter_manifest
 
         write_lora_adapter_manifest(bundle.policy, str(final_adapter))
@@ -898,6 +1149,13 @@ def _finalize_checkpoint(
         "training_args.bin",
         RUN_MANIFEST_NAME,
     ]
+    patch_ledger = checkpoint.parent / IMPLEMENTATION_PATCH_LEDGER_NAME
+    if patch_ledger.is_file():
+        shutil.copy2(
+            patch_ledger,
+            checkpoint / IMPLEMENTATION_PATCH_LEDGER_NAME,
+        )
+        inventory_names.append(IMPLEMENTATION_PATCH_LEDGER_NAME)
     expected_rng_names = _expected_rng_state_names(run_manifest)
     inventory_names.extend(expected_rng_names)
     scaler_path = checkpoint / "scaler.pt"
@@ -967,20 +1225,34 @@ def _expected_rng_state_names(
     return [f"rng_state_{rank}.pth" for rank in range(world_size)]
 
 
-def _audit_trainable_parameter_sync(
-    policy: Any,
-    distributed_context: Any,
-) -> str:
-    """Require byte-identical trainable LoRA tensors on every DDP rank."""
+def _trainable_parameter_items(policy: Any) -> List[tuple[str, Any]]:
+    """Return the ordered, non-empty trainable parameter boundary."""
+
+    items = [
+        (name, parameter)
+        for name, parameter in policy.model.named_parameters()
+        if bool(getattr(parameter, "requires_grad", False))
+    ]
+    if not items:
+        raise GRPORuntimeError("Cannot fingerprint zero trainable parameters")
+    return items
+
+
+def _fingerprint_trainable_parameters(policy: Any) -> str:
+    """Hash ordered trainable parameter names, contracts, and exact bytes."""
+
+    return _fingerprint_parameter_items(
+        _trainable_parameter_items(policy)
+    )
+
+
+def _fingerprint_parameter_items(items: Sequence[tuple[str, Any]]) -> str:
+    """Hash ordered parameter names, contracts, and exact bytes."""
 
     import torch
 
     digest = hashlib.sha256()
-    trainable_count = 0
-    for name, parameter in policy.model.named_parameters():
-        if not bool(getattr(parameter, "requires_grad", False)):
-            continue
-        trainable_count += 1
+    for name, parameter in items:
         tensor = parameter.detach().contiguous()
         digest.update(str(name).encode("utf-8"))
         digest.update(b"\0")
@@ -991,9 +1263,40 @@ def _audit_trainable_parameter_sync(
         byte_tensor = tensor.view(-1).view(dtype=torch.uint8)
         digest.update(byte_tensor.cpu().numpy().tobytes())
         digest.update(b"\0")
-    if trainable_count <= 0:
-        raise GRPORuntimeError("Cannot fingerprint zero trainable parameters")
-    local_digest = digest.hexdigest()
+    return digest.hexdigest()
+
+
+def _reference_parameter_items(policy: Any) -> List[tuple[str, Any]]:
+    """Return the frozen LoRA tensors used by TRL's KL reference policy."""
+
+    items = [
+        (name, parameter)
+        for name, parameter in policy.model.named_parameters()
+        if (
+            ".lora_A.ref." in f".{name}."
+            or ".lora_B.ref." in f".{name}."
+        )
+    ]
+    if not items:
+        raise GRPORuntimeError(
+            "Resume requires the saved KL reference adapter, but the policy "
+            "contains no ref LoRA parameters"
+        )
+    if any(
+        bool(getattr(parameter, "requires_grad", False))
+        for _, parameter in items
+    ):
+        raise GRPORuntimeError("KL reference LoRA parameters must remain frozen")
+    return items
+
+
+def _audit_trainable_parameter_sync(
+    policy: Any,
+    distributed_context: Any,
+) -> str:
+    """Require byte-identical trainable LoRA tensors on every DDP rank."""
+
+    local_digest = _fingerprint_trainable_parameters(policy)
     gathered = distributed_context.all_gather_object(local_digest)
     if len(set(str(value) for value in gathered)) != 1:
         raise GRPORuntimeError(
@@ -1001,6 +1304,165 @@ def _audit_trainable_parameter_sync(
             f"{gathered}"
         )
     return local_digest
+
+
+def _checkpoint_trainable_parameter_sha256(
+    checkpoint_dir: str,
+    distributed_context: Any,
+) -> str:
+    """Read the already-validated rank-zero LoRA digest from a checkpoint."""
+
+    checkpoint = Path(checkpoint_dir).expanduser().resolve()
+
+    def read_digest() -> str:
+        metadata = _read_json(checkpoint / CHECKPOINT_MANIFEST_NAME)
+        value = str(metadata.get("trainable_parameter_sha256", ""))
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise GRPORuntimeError(
+                "Resume checkpoint has no valid trainable LoRA fingerprint"
+            )
+        return value
+
+    return str(
+        distributed_context.call_on_main_and_broadcast(read_digest)
+    )
+
+
+def _synchronize_resumed_trainable_parameters_from_main(
+    policy: Any,
+    distributed_context: Any,
+    *,
+    expected_sha256: str,
+) -> Dict[str, Any]:
+    """Repair PEFT DDP resume using small, checkpoint-anchored broadcasts.
+
+    Some distributed PEFT/Trainer paths load the saved adapter on rank zero and
+    expect DDP construction to copy it to worker ranks.  NavGPT disables that
+    aggregate initialization broadcast after excluding the 14B frozen
+    backbone, so a resume must explicitly restore the same invariant.  The
+    checkpoint-validated rank-zero adapter is authoritative; every trainable
+    tensor is broadcast separately to avoid recreating the problematic large
+    coalesced NCCL allocation.
+    """
+
+    if not bool(getattr(distributed_context, "is_distributed", False)):
+        raise GRPORuntimeError(
+            "Resumed trainable synchronization requires a distributed context"
+        )
+    if re.fullmatch(r"[0-9a-f]{64}", str(expected_sha256)) is None:
+        raise GRPORuntimeError(
+            "Expected checkpoint LoRA fingerprint must be a SHA256 digest"
+        )
+    return _synchronize_parameter_items_from_main(
+        _trainable_parameter_items(policy),
+        distributed_context,
+        label="Trainable LoRA",
+        expected_sha256=str(expected_sha256),
+    )
+
+
+def _synchronize_resumed_reference_parameters_from_main(
+    policy: Any,
+    distributed_context: Any,
+) -> Dict[str, Any]:
+    """Copy TRL's frozen KL-reference LoRA from rank zero after restore."""
+
+    return _synchronize_parameter_items_from_main(
+        _reference_parameter_items(policy),
+        distributed_context,
+        label="Reference LoRA",
+        expected_sha256=None,
+    )
+
+
+def _synchronize_parameter_items_from_main(
+    items: Sequence[tuple[str, Any]],
+    distributed_context: Any,
+    *,
+    label: str,
+    expected_sha256: Optional[str],
+) -> Dict[str, Any]:
+    """Synchronize one ordered parameter set through small broadcasts."""
+
+    if not bool(getattr(distributed_context, "is_distributed", False)):
+        raise GRPORuntimeError(
+            f"{label} synchronization requires a distributed context"
+        )
+    torch_module = getattr(distributed_context, "_torch", None)
+    if torch_module is None:
+        raise GRPORuntimeError(
+            "Resumed trainable synchronization requires the PyTorch process group"
+        )
+
+    local_schema = [
+        {
+            "name": str(name),
+            "dtype": str(parameter.dtype),
+            "shape": [int(value) for value in parameter.shape],
+            "numel": int(parameter.numel()),
+            "device_type": str(parameter.device.type),
+        }
+        for name, parameter in items
+    ]
+    schemas = distributed_context.all_gather_object(local_schema)
+    if any(schema != schemas[0] for schema in schemas[1:]):
+        raise GRPORuntimeError(
+            f"{label} parameter schema differs across DDP ranks"
+        )
+
+    local_before = _fingerprint_parameter_items(items)
+    before_digests = [
+        str(value)
+        for value in distributed_context.all_gather_object(local_before)
+    ]
+    if (
+        expected_sha256 is not None
+        and before_digests[0] != expected_sha256
+    ):
+        raise GRPORuntimeError(
+            f"Rank-zero {label} does not match the resume checkpoint: "
+            f"rank_zero={before_digests[0]}, expected={expected_sha256}"
+        )
+
+    synchronized = len(set(before_digests)) != 1
+    if synchronized:
+        with torch_module.no_grad():
+            for _, parameter in items:
+                if parameter.data.is_contiguous():
+                    torch_module.distributed.broadcast(parameter.data, src=0)
+                    continue
+                buffer = parameter.detach().contiguous()
+                torch_module.distributed.broadcast(buffer, src=0)
+                parameter.copy_(buffer)
+
+    local_after = _fingerprint_parameter_items(items)
+    after_digests = [
+        str(value)
+        for value in distributed_context.all_gather_object(local_after)
+    ]
+    if len(set(after_digests)) != 1:
+        raise GRPORuntimeError(
+            f"{label} parameters remain divergent after synchronization: "
+            f"{after_digests}"
+        )
+    after_sha256 = after_digests[0]
+    if expected_sha256 is not None and after_sha256 != expected_sha256:
+        raise GRPORuntimeError(
+            f"Synchronized {label} does not match the resume checkpoint: "
+            f"actual={after_sha256}, expected={expected_sha256}"
+        )
+
+    return {
+        "synchronized": synchronized,
+        "before_sha256": before_digests,
+        "after_sha256": after_sha256,
+        "tensor_count": len(items),
+        "total_elements": sum(int(parameter.numel()) for _, parameter in items),
+        "max_tensor_bytes": max(
+            int(parameter.numel()) * int(parameter.element_size())
+            for _, parameter in items
+        ),
+    }
 
 
 def _compact_trajectory_step(step: Mapping[str, Any]) -> Dict[str, Any]:
