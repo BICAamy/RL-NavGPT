@@ -618,7 +618,57 @@ def _tool_transcript_violations(
         if navigation_calls > 1:
             violations.append("multiple_navigation_calls_in_one_turn")
 
-    if native_tool_calls != executed_tool_calls:
+    # TRL may stop its native tool loop immediately after generating the
+    # next assistant tool call when max_tool_calling_iterations is reached.
+    # In that case the completion legitimately contains exactly one final
+    # navigation call that has no corresponding execution/tool result.
+    navigation_tool_results = sum(
+        1
+        for message in completion
+        if (
+            isinstance(message, Mapping)
+            and message.get("role") == "tool"
+            and message.get("name") == "submit_navigation_decision"
+        )
+    )
+
+    final_pending_navigation_call = False
+    if completion:
+        final_message = completion[-1]
+        if (
+            isinstance(final_message, Mapping)
+            and final_message.get("role") == "assistant"
+        ):
+            raw_calls = final_message.get("tool_calls")
+            if (
+                isinstance(raw_calls, Sequence)
+                and not isinstance(raw_calls, str)
+            ):
+                final_navigation_calls = 0
+                for call in raw_calls:
+                    if not isinstance(call, Mapping):
+                        continue
+                    function = call.get("function", {})
+                    if (
+                        isinstance(function, Mapping)
+                        and function.get("name")
+                        == "submit_navigation_decision"
+                    ):
+                        final_navigation_calls += 1
+                final_pending_navigation_call = (
+                    final_navigation_calls == 1
+                )
+
+    allowed_external_cutoff = (
+        native_tool_calls == executed_tool_calls + 1
+        and navigation_tool_results == executed_tool_calls
+        and final_pending_navigation_call
+    )
+
+    if (
+        native_tool_calls != executed_tool_calls
+        and not allowed_external_cutoff
+    ):
         violations.append("tool_execution_count_mismatch")
     return violations
 
