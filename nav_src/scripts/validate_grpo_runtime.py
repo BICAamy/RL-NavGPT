@@ -229,6 +229,8 @@ class FakeToolLoopEnvironment:
 
 
 class FakeToolLoopProcessingClass:
+    eos_token_id = 31
+
     def apply_chat_template(
         self,
         messages,
@@ -247,12 +249,20 @@ class FakeToolLoopProcessingClass:
             elif role == "assistant":
                 ids.append(20)
             elif role == "tool":
-                ids.extend((30, 31))
+                # Match Qwen's terminal tail: tool content, EOS, newline.
+                ids.extend((30, self.eos_token_id, 32))
             else:
                 raise AssertionError(f"Unexpected fake chat role: {role}")
         if add_generation_prompt:
             ids.append(40)
         return ids
+
+    def decode(self, token_ids, *, skip_special_tokens=False):
+        del skip_special_tokens
+        return "".join(
+            "\n" if int(token_id) == 32 else "token"
+            for token_id in token_ids
+        )
 
 
 def assistant_tool_call(*policy_outputs: str) -> dict[str, Any]:
@@ -298,6 +308,7 @@ def make_tool_loop_trainer(
     ]
     trainer._async_tool_dicts = [{} for _ in environments]
     trainer.processing_class = FakeToolLoopProcessingClass()
+    trainer.eos_token_id = trainer.processing_class.eos_token_id
     trainer.chat_template = "fake-prefix-preserving-template"
     trainer.chat_template_kwargs = {}
     trainer.max_tool_calling_iterations = max_iterations
@@ -408,21 +419,21 @@ def validate_environment_aware_tool_loop(root: Path) -> None:
     require(
         completion_ids == [
             [101, 30, 31],
-            [102, 30, 31, 40, 77, 30, 31],
+            [102, 30, 31, 32, 40, 77, 30, 31],
         ],
         "Terminal filtering changed model/tool completion IDs",
     )
     require(
         tool_mask == [
             [1, 0, 0],
-            [1, 0, 0, 0, 1, 0, 0],
+            [1, 0, 0, 0, 0, 1, 0, 0],
         ],
         "Terminal tool-result tokens entered the policy mask",
     )
     require(
         logprobs == [
             [0.1, 0.0, 0.0],
-            [0.2, 0.0, 0.0, 0.0, 0.77, 0.0, 0.0],
+            [0.2, 0.0, 0.0, 0.0, 0.0, 0.77, 0.0, 0.0],
         ],
         "Terminal tool-result logprob alignment changed",
     )
@@ -493,7 +504,7 @@ def validate_environment_aware_tool_loop(root: Path) -> None:
         "Legal external-cutoff pending call was removed",
     )
     require(
-        result[0][0] == [1, 0, 0, 0, 1],
+        result[0][0] == [1, 0, 0, 0, 0, 1],
         "External-cutoff model/tool mask changed",
     )
 
@@ -514,6 +525,122 @@ def validate_environment_aware_tool_loop(root: Path) -> None:
         pass
     else:
         raise AssertionError("Drifted private TRL tool-loop signature was accepted")
+
+
+def validate_terminal_suffix_budget_guard(root: Path) -> None:
+    max_completion_length = 4
+    boundary_cases = {
+        # End the already-full completion in EOS to prove the guard audits the
+        # missing tool suffix itself instead of relying on clipped-ratio state.
+        "completion-at-limit": [
+            101,
+            102,
+            103,
+            FakeToolLoopProcessingClass.eos_token_id,
+        ],
+        "one-token-remaining": [101, 102, 103],
+    }
+    for name, completion in boundary_cases.items():
+        environment = FakeToolLoopEnvironment()
+        trainer, generation_calls, _ = make_tool_loop_trainer(
+            root / name,
+            [environment],
+            [],
+            max_iterations=1,
+        )
+        trainer.max_completion_length = max_completion_length
+        try:
+            trainer._tool_call_loop(
+                [[{"role": "user", "content": name}]],
+                [[1]],
+                [completion],
+                [[assistant_tool_call("terminal-budget-boundary")]],
+                [[0.1] * len(completion)],
+                None,
+                {},
+            )
+        except GRPORuntimeError as exc:
+            require(
+                "Terminal tool-result suffix exceeds max_completion_length"
+                in str(exc),
+                f"{name} produced the wrong fail-closed diagnostic: {exc}",
+            )
+        else:
+            raise AssertionError(
+                f"{name} silently truncated the terminal suffix/EOS"
+            )
+        require(
+            environment.calls == ["terminal-budget-boundary"],
+            f"{name} did not reach the terminal environment transition",
+        )
+        require(
+            not generation_calls,
+            f"{name} generated another assistant turn after terminal",
+        )
+
+    exact_fit = FakeToolLoopEnvironment()
+    trainer, generation_calls, _ = make_tool_loop_trainer(
+        root / "terminal-suffix-exact-fit",
+        [exact_fit],
+        [],
+        max_iterations=1,
+    )
+    trainer.max_completion_length = max_completion_length
+    result = trainer._tool_call_loop(
+        [[{"role": "user", "content": "terminal-suffix-exact-fit"}]],
+        [[1]],
+        [[101, 102]],
+        [[assistant_tool_call("terminal-budget-boundary")]],
+        [[0.1, 0.2]],
+        None,
+        {},
+    )
+    require(
+        result[2] == [[101, 102, 30, trainer.eos_token_id]],
+        "An exactly fitting terminal suffix was not retained through EOS",
+    )
+    require(
+        result[0] == [[1, 1, 0, 0]]
+        and result[3] == [[0.1, 0.2, 0.0, 0.0]],
+        "An exactly fitting terminal suffix misaligned mask/logprobs",
+    )
+    require(
+        not generation_calls,
+        "An exactly fitting terminal suffix generated another assistant turn",
+    )
+
+    context_overflow = FakeToolLoopEnvironment()
+    trainer, generation_calls, _ = make_tool_loop_trainer(
+        root / "terminal-suffix-model-context-overflow",
+        [context_overflow],
+        [],
+        max_iterations=1,
+    )
+    trainer.max_completion_length = max_completion_length
+    trainer.model.config.max_position_embeddings = max_completion_length
+    try:
+        trainer._tool_call_loop(
+            [[{"role": "user", "content": "context-overflow"}]],
+            [[1]],
+            [[101, 102]],
+            [[assistant_tool_call("terminal-budget-boundary")]],
+            [[0.1, 0.2]],
+            None,
+            {},
+        )
+    except GRPORuntimeError as exc:
+        require(
+            "Terminal tool-result suffix exceeds the model context" in str(exc),
+            f"Model-context overflow produced the wrong diagnostic: {exc}",
+        )
+    else:
+        raise AssertionError(
+            "Terminal suffix overflowed max_model_len without failing closed"
+        )
+    require(
+        not generation_calls,
+        "Model-context overflow generated another assistant turn after terminal",
+    )
 
 
 def validate_logging(root: Path) -> None:
@@ -738,6 +865,7 @@ def validate_run_manifest_model_binding(root: Path) -> None:
     optimization = GRPOOptimizationConfig(
         output_dir=str(output),
         max_completion_length=32,
+        assistant_max_new_tokens=16,
     )
     runtime_contract = {
         "trl_version": "0.29.1",
@@ -1044,11 +1172,13 @@ def main() -> None:
         root = Path(value)
         validate_logging(root)
         validate_environment_aware_tool_loop(root)
+        validate_terminal_suffix_budget_guard(root)
         validate_run_manifest_model_binding(root)
         validate_checkpoint_contract(root)
     print("PASS stage-six logging and resume contract")
     print("- canonical reward unchanged; navigation metrics and compact traces logged")
     print("- terminal-aware TRL tool loop preserves mixed-batch IDs and masks")
+    print("- terminal suffix budget boundaries fail closed before EOS truncation")
     print("- run identity is bound to exact local Qwen Safetensors weights")
     print(
         "- LoRA/ref plus optimizer, scheduler, FP16 scaler, RNG, "

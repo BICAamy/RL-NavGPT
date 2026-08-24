@@ -100,6 +100,7 @@ def _run(args: argparse.Namespace, distributed: DistributedContext) -> None:
     optimization = GRPOOptimizationConfig(
         output_dir=args.output_dir,
         max_completion_length=args.max_completion_length,
+        assistant_max_new_tokens=args.assistant_max_new_tokens,
         num_generations=args.num_generations,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -420,6 +421,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--max-completion-length", type=int, required=True)
+    parser.add_argument(
+        "--assistant-max-new-tokens",
+        type=int,
+        default=256,
+        help=(
+            "maximum generated tokens for each assistant turn; the aggregate "
+            "max-completion-length must also reserve every tool-result suffix"
+        ),
+    )
     parser.add_argument("--num-generations", type=int, default=4)
     parser.add_argument(
         "--steps-per-generation",

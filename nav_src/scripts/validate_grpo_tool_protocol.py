@@ -31,6 +31,7 @@ if str(NAV_SRC_DIR) not in sys.path:
 
 from grpo_runtime import (  # noqa: E402
     GRPORuntimeError,
+    _terminal_tool_suffix_ids,
     navigation_grpo_trainer_class,
 )
 from rl_env import (  # noqa: E402
@@ -122,8 +123,11 @@ class DriftedTrainerDouble:
 class FakeProcessingClass:
     """Prefix-preserving terminal-tool renderer used by the production loop."""
 
-    def __init__(self) -> None:
+    eos_token_id = 90
+
+    def __init__(self, *, trailing_text: str = "\n") -> None:
         self.calls: List[bool] = []
+        self.trailing_text = trailing_text
 
     def apply_chat_template(
         self,
@@ -137,12 +141,20 @@ class FakeProcessingClass:
         del chat_template, return_dict
         self.calls.append(bool(add_generation_prompt))
         prefix = [41, 42]
-        suffix = [
+        tool_ids = [
             70 + index
             for index, message in enumerate(conversation[2:])
             if message.get("role") == "tool"
         ]
+        suffix = tool_ids + ([self.eos_token_id, 91] if tool_ids else [])
         return prefix + suffix
+
+    def decode(self, token_ids, *, skip_special_tokens=False):
+        del skip_special_tokens
+        return "".join(
+            self.trailing_text if int(token_id) == 91 else "token"
+            for token_id in token_ids
+        )
 
 
 @dataclass
@@ -307,6 +319,7 @@ def run_loop(
         config=SimpleNamespace(max_position_embeddings=16_384)
     )
     trainer.processing_class = FakeProcessingClass()
+    trainer.eos_token_id = trainer.processing_class.eos_token_id
     trainer.chat_template = "scripted-prefix-preserving-template"
     trainer.chat_template_kwargs = {}
     _bind_scripted_backend(trainer, responses=generated_responses)
@@ -517,6 +530,21 @@ def validate_signature_guard(base_trainer_cls: type) -> None:
         raise AssertionError("A drifted private TRL tool-loop signature was accepted")
 
 
+def validate_terminal_suffix_tail_guard() -> None:
+    trainer = SimpleNamespace(
+        processing_class=FakeProcessingClass(trailing_text="semantic-tail"),
+        eos_token_id=FakeProcessingClass.eos_token_id,
+        chat_template="scripted-prefix-preserving-template",
+        chat_template_kwargs={},
+    )
+    try:
+        _terminal_tool_suffix_ids(trainer, [tool_result()])
+    except GRPORuntimeError:
+        pass
+    else:
+        raise AssertionError("A semantic token tail after terminal EOS was stripped")
+
+
 def validate_case_a_normal_move(base_trainer_cls: type) -> None:
     environment = ScriptedEnvironment("case-a")
     run = run_loop(
@@ -558,6 +586,11 @@ def _validate_terminal_case(
     require(run.trainer.generate_batches == [], f"{action} generated after terminal")
     require(run.tool_call_count == 1, f"{action} has the wrong loop call count")
     require(run.tool_mask[0][-1] == 0, f"{action} terminal suffix was not masked")
+    require(
+        run.result[2][0][-1] == run.trainer.eos_token_id
+        and 91 not in run.result[2][0],
+        f"{action} did not end exactly at EOS",
+    )
     require(
         run.trainer.processing_class.calls
         and not any(run.trainer.processing_class.calls),
@@ -840,11 +873,13 @@ def main() -> None:
     args = build_parser().parse_args()
     validate_locked_dependencies()
     validate_transcript_state_machine()
+    validate_terminal_suffix_tail_guard()
     validate_protocol_suite(PinnedTrainerDouble)
     print("PASS: dependency-light GRPO navigation tool protocol")
     print("- A move continuation; B successful Finish; C premature Finish")
     print("- D max_steps; E legal external cutoff with one pending call")
     print("- terminal state wins when the final tool round reaches the iteration cap")
+    print("- terminal template whitespace after EOS is removed fail-closed")
     print("- terminal pending/actual calls; mixed batch; multiple calls")
     print("- strict assistant/tool pairing; orphan, missing, and unknown records")
     print("- pinned eight-parameter input and six-value output boundary")

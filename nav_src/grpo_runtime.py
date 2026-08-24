@@ -431,7 +431,15 @@ def _terminal_tool_suffix_ids(
     trainer: Any,
     tool_messages: Sequence[Any],
 ) -> List[int]:
-    """Render terminal tool results without a dangling assistant prompt."""
+    """Render a terminal tool result ending exactly at the final EOS token.
+
+    Qwen's chat template renders a completed tool message as
+    ``<|im_end|>\n``.  TRL 0.29.1 classifies a completion as clipped by testing
+    its final token against EOS/PAD, so retaining that template-only newline
+    produces a false clipped completion even though the conversation ended
+    correctly.  Strip only whitespace tokens after the final EOS; any semantic
+    tail fails closed.
+    """
 
     dummy_messages = [
         {"role": "user", "content": "dummy"},
@@ -455,7 +463,69 @@ def _terminal_tool_suffix_ids(
         raise GRPORuntimeError(
             "Terminal tool-result tokenization is not prefix preserving"
         )
-    return list(full_ids[len(prefix_ids) :])
+    suffix_ids = list(full_ids[len(prefix_ids) :])
+
+    raw_eos_token_ids = getattr(trainer, "eos_token_id", None)
+    if raw_eos_token_ids is None:
+        raw_eos_token_ids = getattr(
+            trainer.processing_class,
+            "eos_token_id",
+            None,
+        )
+    if hasattr(raw_eos_token_ids, "tolist"):
+        raw_eos_token_ids = raw_eos_token_ids.tolist()
+    if isinstance(raw_eos_token_ids, int) and not isinstance(
+        raw_eos_token_ids,
+        bool,
+    ):
+        eos_token_ids = {int(raw_eos_token_ids)}
+    elif isinstance(raw_eos_token_ids, Sequence) and not isinstance(
+        raw_eos_token_ids,
+        (str, bytes),
+    ):
+        eos_token_ids = {
+            int(token_id)
+            for token_id in raw_eos_token_ids
+            if isinstance(token_id, int) and not isinstance(token_id, bool)
+        }
+    else:
+        eos_token_ids = set()
+    if not eos_token_ids:
+        raise GRPORuntimeError(
+            "Terminal tool-result tokenization requires an EOS token ID"
+        )
+
+    final_eos_index = next(
+        (
+            index
+            for index in range(len(suffix_ids) - 1, -1, -1)
+            if suffix_ids[index] in eos_token_ids
+        ),
+        None,
+    )
+    if final_eos_index is None:
+        raise GRPORuntimeError(
+            "Terminal tool-result suffix does not contain an EOS token"
+        )
+    trailing_ids = suffix_ids[final_eos_index + 1 :]
+    if trailing_ids:
+        decode = getattr(trainer.processing_class, "decode", None)
+        if not callable(decode):
+            raise GRPORuntimeError(
+                "Cannot audit tokens following terminal tool-result EOS"
+            )
+        trailing_text = decode(trailing_ids, skip_special_tokens=False)
+        if not isinstance(trailing_text, str) or trailing_text.strip():
+            raise GRPORuntimeError(
+                "Terminal tool-result suffix contains non-whitespace tokens "
+                "after its final EOS"
+            )
+        suffix_ids = suffix_ids[: final_eos_index + 1]
+    if not suffix_ids or suffix_ids[-1] not in eos_token_ids:
+        raise GRPORuntimeError(
+            "Terminal tool-result suffix was not normalized to EOS"
+        )
+    return suffix_ids
 
 
 def _parse_trl_tool_response(trainer: Any, token_ids: Sequence[int]) -> Dict[str, Any]:
@@ -615,6 +685,20 @@ def _environment_aware_tool_call_loop(
                 suffix_ids = _terminal_tool_suffix_ids(self, tool_messages)
             else:
                 suffix_ids = self._get_tool_suffix_ids(tool_messages)
+            if (
+                terminal_after_tools[local_index]
+                and len(completion_ids[idx_with_tool]) + len(suffix_ids)
+                > self.max_completion_length
+            ):
+                raise GRPORuntimeError(
+                    "Terminal tool-result suffix exceeds max_completion_length: "
+                    f"sample_index={idx_with_tool}, "
+                    "assistant_and_prior_tool_tokens="
+                    f"{len(completion_ids[idx_with_tool])}, "
+                    f"terminal_suffix_tokens={len(suffix_ids)}, "
+                    f"limit={self.max_completion_length}. Configure a per-turn "
+                    "generation limit that reserves terminal-suffix capacity."
+                )
             prompt_completion_tool_ids.append(
                 prompt_ids[idx_with_tool]
                 + completion_ids[idx_with_tool]
@@ -632,6 +716,19 @@ def _environment_aware_tool_call_loop(
                 "Unsupported mode detected: "
                 f"use_vllm={self.use_vllm}, vllm_mode={self.vllm_mode}"
             )
+        for idx_with_tool, prompt_completion, terminal in zip(
+            idxs_with_tool,
+            prompt_completion_tool_ids,
+            terminal_after_tools,
+            strict=True,
+        ):
+            if terminal and len(prompt_completion) > max_model_len:
+                raise GRPORuntimeError(
+                    "Terminal tool-result suffix exceeds the model context: "
+                    f"sample_index={idx_with_tool}, "
+                    f"prompt_completion_tokens={len(prompt_completion)}, "
+                    f"max_model_len={max_model_len}."
+                )
         overlong = [
             len(prompt_completion) >= max_model_len
             for prompt_completion in prompt_completion_tool_ids

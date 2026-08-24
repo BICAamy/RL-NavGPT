@@ -147,6 +147,7 @@ def _optimization_config(
     return GRPOOptimizationConfig(
         output_dir=str(output_dir),
         max_completion_length=completion_length,
+        assistant_max_new_tokens=args.assistant_tokens_per_turn,
         num_generations=4,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
@@ -699,6 +700,14 @@ def _run_level3(args: argparse.Namespace) -> None:
         components,
         optimization,
     )
+    assistant_max_new_tokens = int(
+        level2["token_budget"]["assistant_tokens_per_turn"]
+    )
+    require(
+        int(bundle.trainer.generation_config.max_new_tokens)
+        == assistant_max_new_tokens,
+        "TRL did not enforce the audited per-turn assistant token ceiling",
+    )
     generator = getattr(bundle.trainer, "_generate_and_score_completions", None)
     require(callable(generator), "Pinned GRPOTrainer lost its single-group generation boundary")
     bundle.metrics_recorder.start_session(None)
@@ -723,8 +732,73 @@ def _run_level3(args: argparse.Namespace) -> None:
     )
     require(bool(clipped_metrics), "TRL did not report completion clipping")
     clipped_ratio = float(clipped_metrics[-1])
-    require(clipped_ratio == 0.0, "The real single group exhausted its audited completion budget")
     summaries = [environment.rollout_summary for environment in bundle.trainer.environments]
+    completion_ids_cpu = scored["completion_ids"].detach().cpu()
+    eos_token_id = int(bundle.trainer.eos_token_id)
+    pad_token_id = int(bundle.trainer.pad_token_id)
+    last_completion_token_ids = [
+        int(token_ids[int(length) - 1])
+        for token_ids, length in zip(
+            completion_ids_cpu,
+            lengths,
+            strict=True,
+        )
+    ]
+    clipped_flags = [
+        token_id not in {eos_token_id, pad_token_id}
+        for token_id in last_completion_token_ids
+    ]
+    inferred_clipped_ratio = sum(clipped_flags) / len(clipped_flags)
+    require(
+        math.isclose(
+            clipped_ratio,
+            inferred_clipped_ratio,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ),
+        "TRL clipped-ratio metric disagrees with completion terminal tokens",
+    )
+    if clipped_ratio != 0.0:
+        _write_json_exclusive(
+            output / "clipping_failure.json",
+            {
+                "schema_version": REPORT_SCHEMA_VERSION,
+                "failure": "completion_did_not_end_in_eos_or_pad",
+                "clipped_ratio": clipped_ratio,
+                "smoke_max_completion_length": completion_length,
+                "completion_total_tokens": [int(value) for value in lengths],
+                "completion_model_tokens": [int(value) for value in model_lengths],
+                "last_completion_token_ids": last_completion_token_ids,
+                "eos_token_id": eos_token_id,
+                "pad_token_id": pad_token_id,
+                "clipped_flags": clipped_flags,
+                "rollouts": [
+                    None
+                    if summary is None
+                    else {
+                        "termination_reason": str(summary.termination_reason),
+                        "environment_termination_reason": (
+                            summary.environment_termination_reason
+                        ),
+                        "attempted_tool_call_count": int(
+                            summary.attempted_tool_call_count
+                        ),
+                        "executed_tool_call_count": int(
+                            summary.executed_tool_call_count
+                        ),
+                        "protocol_violations": list(
+                            summary.protocol_violations
+                        ),
+                    }
+                    for summary in summaries
+                ],
+            },
+        )
+    require(
+        clipped_ratio == 0.0,
+        "The real single group contains a completion that did not end in "
+        "EOS/PAD; see level3/clipping_failure.json",
+    )
     require(all(summary is not None for summary in summaries), "A real rollout was not finalized")
     require(
         all(summary.instr_id == str(row["instr_id"]) for summary in summaries),
@@ -768,12 +842,17 @@ def _run_level3(args: argparse.Namespace) -> None:
         "num_generations": 4,
         "smoke_tool_iterations": int(args.smoke_tool_iterations),
         "smoke_max_completion_length": completion_length,
+        "assistant_max_new_tokens": assistant_max_new_tokens,
         "production_max_completion_length": int(
             level2["token_budget"]["recommended_max_completion_length"]
         ),
         "completion_total_tokens": [int(value) for value in lengths],
         "completion_model_tokens": [int(value) for value in model_lengths],
         "completion_clipped_ratio": clipped_ratio,
+        "last_completion_token_ids": last_completion_token_ids,
+        "eos_token_id": eos_token_id,
+        "pad_token_id": pad_token_id,
+        "clipped_flags": clipped_flags,
         "advantages": [float(value) for value in advantages.tolist()],
         "episode_returns": [float(summary.episode_return) for summary in summaries],
         "attempted_tool_call_counts": [
@@ -898,6 +977,7 @@ def _worker_command(
         "--lora-dropout", str(args.lora_dropout),
         "--max-trainable-percentage", str(args.max_trainable_percentage),
         "--smoke-tool-iterations", str(args.smoke_tool_iterations),
+        "--assistant-tokens-per-turn", str(args.assistant_tokens_per_turn),
         "--seed", str(args.seed),
         "--worker-output-dir", str(output),
     ]

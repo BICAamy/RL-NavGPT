@@ -156,6 +156,7 @@ class GRPOOptimizationConfig:
 
     output_dir: str
     max_completion_length: Optional[int] = None
+    assistant_max_new_tokens: int = 256
     num_generations: int = 4
     per_device_train_batch_size: int = 1
     gradient_accumulation_steps: int = 4
@@ -269,9 +270,20 @@ class GRPOOptimizationConfig:
             raise ValueError("temperature must be finite and positive")
         if not 0.0 < self.top_p <= 1.0:
             raise ValueError("top_p must be in (0, 1]")
+        if (
+            isinstance(self.assistant_max_new_tokens, bool)
+            or not isinstance(self.assistant_max_new_tokens, int)
+            or self.assistant_max_new_tokens <= 0
+        ):
+            raise ValueError("assistant_max_new_tokens must be a positive integer")
         if self.max_completion_length is not None:
             if self.max_completion_length <= 0:
                 raise ValueError("max_completion_length must be positive")
+            if self.assistant_max_new_tokens > self.max_completion_length:
+                raise ValueError(
+                    "assistant_max_new_tokens cannot exceed "
+                    "max_completion_length"
+                )
         if self.trainer_max_steps == 0 or self.trainer_max_steps < -1:
             raise ValueError("trainer_max_steps must be -1 or positive")
         if self.num_train_epochs <= 0:
@@ -384,6 +396,7 @@ def audit_trl_runtime_contract(
         "num_generations",
         "steps_per_generation",
         "max_completion_length",
+        "generation_kwargs",
         "max_tool_calling_iterations",
         "beta",
         "temperature",
@@ -898,6 +911,12 @@ def build_trl_grpo_config(
         "steps_per_generation": config.steps_per_generation,
         "num_generations": config.num_generations,
         "max_completion_length": max_completion_length,
+        # TRL otherwise reuses the aggregate completion budget for *each*
+        # assistant turn.  The audited aggregate reserves tool-result suffixes
+        # by assuming this per-turn ceiling, so make that assumption executable.
+        "generation_kwargs": {
+            "max_new_tokens": config.assistant_max_new_tokens,
+        },
         "max_tool_calling_iterations": config.max_tool_calling_iterations,
         "learning_rate": config.learning_rate,
         "weight_decay": config.weight_decay,

@@ -110,6 +110,7 @@ class FakeGRPOConfig:
         num_generations: int,
         steps_per_generation: int,
         max_completion_length: int,
+        generation_kwargs: Mapping[str, Any],
         max_tool_calling_iterations: int,
         beta: float,
         scale_rewards: str,
@@ -165,6 +166,7 @@ class FakeGRPOConfig:
             num_generations=num_generations,
             steps_per_generation=steps_per_generation,
             max_completion_length=max_completion_length,
+            generation_kwargs=dict(generation_kwargs),
             max_tool_calling_iterations=max_tool_calling_iterations,
             beta=beta,
             scale_rewards=scale_rewards,
@@ -1012,10 +1014,38 @@ def validate_trainer_assembly(components: Any) -> None:
     else:
         raise AssertionError("Unset completion token budget was accepted")
 
+    for invalid_cap in (True, 0, 1.5, "256"):
+        try:
+            GRPOOptimizationConfig(
+                output_dir="outputs/grpo",
+                max_completion_length=256,
+                assistant_max_new_tokens=invalid_cap,  # type: ignore[arg-type]
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                "Invalid assistant generation ceiling was accepted: "
+                f"{invalid_cap!r}"
+            )
     try:
         GRPOOptimizationConfig(
             output_dir="outputs/grpo",
             max_completion_length=128,
+            assistant_max_new_tokens=129,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(
+            "Per-turn assistant generation ceiling exceeded the aggregate budget"
+        )
+
+    try:
+        GRPOOptimizationConfig(
+            output_dir="outputs/grpo",
+            max_completion_length=128,
+            assistant_max_new_tokens=64,
             num_generations=2,
             steps_per_generation=2,
             gradient_accumulation_steps=3,
@@ -1089,6 +1119,10 @@ def validate_trainer_assembly(components: Any) -> None:
         "Environment failures would be masked from optimization",
     )
     require(
+        bundle.args.generation_kwargs == {"max_new_tokens": 256},
+        "Audited per-turn assistant generation ceiling was not enforced",
+    )
+    require(
         bundle.args.reward_weights == [1.0],
         "Composite episode reward would be reweighted twice",
     )
@@ -1136,7 +1170,7 @@ def run_contract() -> None:
     print("- ordered bounded failure shaping and idempotent finalization")
     print("- one composite reward and one stateful environment factory")
     print("- LoRA-only policy plus explicit GRPO/KL/group-scaling settings")
-    print("- completion token-budget gate before trainer construction")
+    print("- aggregate completion budget plus enforced per-turn generation ceiling")
 
 
 def run_runtime() -> None:
@@ -1149,12 +1183,17 @@ def run_runtime() -> None:
         GRPOOptimizationConfig(
             output_dir=str(NAV_SRC_DIR.parent / "outputs" / "grpo-runtime-audit"),
             max_completion_length=128,
+            assistant_max_new_tokens=64,
         )
     )
     require(actual_config.loss_type == "grpo", "Real GRPOConfig changed loss")
     require(
         actual_config.bf16 is True and actual_config.fp16 is False,
         "Real GRPOConfig changed mixed precision",
+    )
+    require(
+        actual_config.generation_kwargs == {"max_new_tokens": 64},
+        "Real GRPOConfig dropped the per-turn generation ceiling",
     )
     print("PASS stage-six installed runtime contract")
     print(

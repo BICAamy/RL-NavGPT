@@ -569,6 +569,7 @@ def validate_batch_derivation() -> None:
     GRPOOptimizationConfig(
         output_dir="outputs/ddp-contract",
         max_completion_length=32,
+        assistant_max_new_tokens=16,
         num_generations=4,
         gradient_accumulation_steps=1,
         steps_per_generation=1,
@@ -581,6 +582,7 @@ def validate_batch_derivation() -> None:
             GRPOOptimizationConfig(
                 output_dir="outputs/ddp-contract",
                 max_completion_length=32,
+                assistant_max_new_tokens=16,
                 num_generations=4,
                 gradient_accumulation_steps=1,
                 steps_per_generation=1,
