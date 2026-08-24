@@ -735,6 +735,25 @@ def _run_level3(args: argparse.Namespace) -> None:
         "The real 14B group made no navigation tool call; tool transport is not operational",
     )
     require(
+        all(
+            int(summary.attempted_tool_call_count)
+            == int(summary.executed_tool_call_count)
+            for summary in summaries
+        ),
+        "A real rollout attempted a navigation tool call after the episode ended",
+    )
+    require(
+        all(not summary.protocol_violations for summary in summaries),
+        "A real rollout violated the native navigation tool protocol",
+    )
+    require(
+        all(
+            str(summary.termination_reason) != "trl_protocol_violation"
+            for summary in summaries
+        ),
+        "A real rollout was finalized as a TRL protocol violation",
+    )
+    require(
         not any(step.get("environment_error") for env in bundle.trainer.environments for step in env.trajectory),
         "A real 14B rollout hit an internal environment error",
     )
@@ -757,7 +776,16 @@ def _run_level3(args: argparse.Namespace) -> None:
         "completion_clipped_ratio": clipped_ratio,
         "advantages": [float(value) for value in advantages.tolist()],
         "episode_returns": [float(summary.episode_return) for summary in summaries],
+        "attempted_tool_call_counts": [
+            int(summary.attempted_tool_call_count) for summary in summaries
+        ],
+        "executed_tool_call_counts": [
+            int(summary.executed_tool_call_count) for summary in summaries
+        ],
         "tool_call_counts": [int(summary.tool_call_count) for summary in summaries],
+        "protocol_violations": [
+            list(summary.protocol_violations) for summary in summaries
+        ],
         "termination_reasons": [str(summary.termination_reason) for summary in summaries],
         "trainable_lora_parameters": int(bundle.policy.parameter_report.trainable_parameters),
         "cuda_peak_allocated_bytes": peak,

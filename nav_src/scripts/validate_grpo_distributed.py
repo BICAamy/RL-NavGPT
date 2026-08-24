@@ -64,8 +64,13 @@ class FakeSummary:
             "success": self.rank == 0,
             "oracle_success": self.rank == 0,
             "truncated": self.rank != 0,
+            "environment_termination_reason": (
+                "goal_reached" if self.rank == 0 else "max_steps"
+            ),
             "protocol_violations": [],
             "step_count": 1,
+            "attempted_tool_call_count": 1,
+            "executed_tool_call_count": 1,
             "tool_call_count": 1,
             "distance_to_goal": float(self.rank),
             "minimum_distance_to_goal": float(self.rank),

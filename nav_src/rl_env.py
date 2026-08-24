@@ -98,8 +98,11 @@ class RolloutSummary:
     oracle_success: bool
     terminated: bool
     truncated: bool
+    environment_termination_reason: Optional[str]
     termination_reason: str
     step_count: int
+    attempted_tool_call_count: int
+    executed_tool_call_count: int
     tool_call_count: int
     distance_to_goal: float
     minimum_distance_to_goal: float
@@ -117,8 +120,11 @@ class RolloutSummary:
             "oracle_success": self.oracle_success,
             "terminated": self.terminated,
             "truncated": self.truncated,
+            "environment_termination_reason": self.environment_termination_reason,
             "termination_reason": self.termination_reason,
             "step_count": self.step_count,
+            "attempted_tool_call_count": self.attempted_tool_call_count,
+            "executed_tool_call_count": self.executed_tool_call_count,
             "tool_call_count": self.tool_call_count,
             "distance_to_goal": self.distance_to_goal,
             "minimum_distance_to_goal": self.minimum_distance_to_goal,
@@ -157,9 +163,22 @@ TRL_NAVIGATION_TOOL_PROTOCOL = (
     "ordinary assistant text. Call `submit_navigation_decision` "
     "exactly once per navigation step. Its `policy_output` argument "
     "must contain exactly the canonical <Think>...</Think> followed "
-    "by <Action>...</Action> text specified above. After each tool "
-    "result, either call the same tool again or submit a canonical "
-    "finish action through it."
+    "by <Action>...</Action> text specified above. After each "
+    "non-terminal tool result, call the same tool again with the next "
+    "decision, which may be a canonical finish action. If a tool result "
+    "reports that the episode terminated or truncated, do not call any "
+    "tool again; end the conversation immediately."
+)
+
+TRL_NAVIGATION_CONTINUE_RESULT_SUFFIX = (
+    "\nCall `submit_navigation_decision` with the next canonical "
+    "<Think>/<Action> decision."
+)
+TRL_NAVIGATION_TERMINAL_RESULT_SUFFIX = (
+    "\nEpisode terminated/truncated with reason `{termination_reason}`. "
+    "DO NOT call "
+    "`submit_navigation_decision` or any other tool again. End the "
+    "conversation now without another navigation decision."
 )
 
 
@@ -169,6 +188,24 @@ def format_trl_navigation_observation(policy_prompt: str) -> str:
     if not isinstance(policy_prompt, str) or not policy_prompt:
         raise ValueError("policy_prompt must be a non-empty string")
     return "\n\n" + policy_prompt + TRL_NAVIGATION_TOOL_PROTOCOL
+
+
+def _format_trl_navigation_tool_result(
+    observation: str,
+    *,
+    episode_done: bool,
+    termination_reason: Optional[str] = None,
+) -> str:
+    """Append exactly one continuation or terminal instruction to a tool result."""
+
+    if episode_done:
+        reason = str(termination_reason or "environment_terminal")
+        suffix = TRL_NAVIGATION_TERMINAL_RESULT_SUFFIX.format(
+            termination_reason=reason,
+        )
+    else:
+        suffix = TRL_NAVIGATION_CONTINUE_RESULT_SUFFIX
+    return str(observation) + suffix
 
 
 class NavGPTEnvironmentFactory:
@@ -340,7 +377,8 @@ class NavGPTTRLEnvironment:
         self._environment: Optional[NavGPTGymEnv] = None
         self._last_info: Optional[Dict[str, Any]] = None
         self._rollout_summary: Optional[RolloutSummary] = None
-        self._tool_call_count = 0
+        self._attempted_tool_call_count = 0
+        self._executed_tool_call_count = 0
         self._protocol_violations: List[str] = []
 
     @property
@@ -367,6 +405,47 @@ class NavGPTTRLEnvironment:
 
         return self._rollout_summary
 
+    @property
+    def episode_done(self) -> bool:
+        """Whether the active Gym episode has terminated or truncated."""
+
+        info = self._last_info
+        return bool(
+            info
+            and (
+                bool(info.get("terminated", False))
+                or bool(info.get("truncated", False))
+            )
+        )
+
+    @property
+    def attempted_tool_call_count(self) -> int:
+        """Number of tool invocations, including rejected post-terminal calls."""
+
+        return int(self._attempted_tool_call_count)
+
+    @property
+    def executed_tool_call_count(self) -> int:
+        """Number of calls dispatched to ``NavGPTGymEnv.step``."""
+
+        return int(self._executed_tool_call_count)
+
+    @property
+    def _tool_call_count(self) -> int:
+        """Backward-compatible private alias for attempted tool calls."""
+
+        return self.attempted_tool_call_count
+
+    @_tool_call_count.setter
+    def _tool_call_count(self, value: int) -> None:
+        # Before the counter split this field was incremented before the
+        # terminal guard, so its historical/logged meaning is attempted calls.
+        # Legacy synthetic fixtures only model clean calls, hence initialize
+        # both counters to the supplied value.
+        compatible_count = int(value)
+        self._attempted_tool_call_count = compatible_count
+        self._executed_tool_call_count = compatible_count
+
     def reset(self, instr_id: str, **_: Any) -> str:
         """Reset a rollout to the exact task supplied by the dataset row.
 
@@ -384,7 +463,8 @@ class NavGPTTRLEnvironment:
         )
         self._last_info = info
         self._rollout_summary = None
-        self._tool_call_count = 0
+        self._attempted_tool_call_count = 0
+        self._executed_tool_call_count = 0
         self._protocol_violations = []
         return format_trl_navigation_observation(prompt)
 
@@ -406,24 +486,22 @@ class NavGPTTRLEnvironment:
         if self._rollout_summary is not None:
             return self._rollout_summary
 
+        episode_ended = self.episode_done
+        attempted_tool_calls = self.attempted_tool_call_count
+        executed_tool_calls = self.executed_tool_call_count
         violations = list(self._protocol_violations)
         if completion is not None:
             violations.extend(
                 _tool_transcript_violations(
                     completion,
-                    executed_tool_calls=self._tool_call_count,
+                    attempted_tool_calls=attempted_tool_calls,
+                    executed_tool_calls=executed_tool_calls,
+                    episode_done=episode_ended,
                 )
             )
         violations = list(dict.fromkeys(violations))
 
         raw_episode_return = float(self._environment.get_reward())
-        episode_ended = bool(
-            self._last_info
-            and (
-                self._last_info["terminated"]
-                or self._last_info["truncated"]
-            )
-        )
 
         component_totals: Dict[str, float] = {}
         for step in self._environment.trajectory:
@@ -471,7 +549,7 @@ class NavGPTTRLEnvironment:
         elif not episode_ended:
             termination_reason = (
                 "trl_no_navigation_tool_call"
-                if self._tool_call_count == 0
+                if executed_tool_calls == 0
                 else "trl_external_cutoff"
             )
         else:
@@ -479,7 +557,7 @@ class NavGPTTRLEnvironment:
                 info.get("termination_reason") or "environment_terminal"
             )
 
-        self._rollout_summary = RolloutSummary(
+        summary = RolloutSummary(
             instr_id=str(info.get("instr_id", "")),
             raw_episode_return=raw_episode_return,
             episode_return=final_return,
@@ -495,9 +573,18 @@ class NavGPTTRLEnvironment:
                 or not episode_ended
                 or bool(violations)
             ),
+            environment_termination_reason=(
+                None
+                if info.get("termination_reason") is None
+                else str(info["termination_reason"])
+            ),
             termination_reason=termination_reason,
             step_count=int(info.get("step_count", 0)),
-            tool_call_count=self._tool_call_count,
+            attempted_tool_call_count=attempted_tool_calls,
+            executed_tool_call_count=executed_tool_calls,
+            # Keep the schema-v2 field's historical semantics.  Before the
+            # split it was incremented before the terminal-state check.
+            tool_call_count=attempted_tool_calls,
             distance_to_goal=float(info.get("distance_to_goal", math.inf)),
             minimum_distance_to_goal=float(
                 info.get("minimum_distance_to_goal", math.inf)
@@ -507,7 +594,12 @@ class NavGPTTRLEnvironment:
             ),
             protocol_violations=tuple(violations),
         )
-        return self._rollout_summary
+        # A completion-free read cannot certify the native transcript.  Keep it
+        # provisional so a later standard TRL reward call can still fail closed
+        # after inspecting the real completion.
+        if completion is not None:
+            self._rollout_summary = summary
+        return summary
 
     def submit_navigation_decision(self, policy_output: str) -> str:
         """Execute one complete canonical navigation policy decision.
@@ -526,26 +618,30 @@ class NavGPTTRLEnvironment:
             raise RuntimeError(
                 "reset() must be called before submit_navigation_decision()"
             )
-        self._tool_call_count += 1
-        if self._last_info and (
-            self._last_info["terminated"] or self._last_info["truncated"]
-        ):
+        if self._rollout_summary is not None:
+            raise RuntimeError("navigation rollout has already been finalized")
+        self._attempted_tool_call_count += 1
+        if self.episode_done:
             self._protocol_violations.append("tool_call_after_episode_end")
-            return (
+            observation = (
                 "Episode already ended with reason "
                 f'{self._last_info["termination_reason"]}; do not issue '
                 "another navigation decision."
             )
+            return _format_trl_navigation_tool_result(
+                observation,
+                episode_done=True,
+                termination_reason=self._last_info.get("termination_reason"),
+            )
+        self._executed_tool_call_count += 1
         _, _, _, _, info = self._environment.step(policy_output)
         self._last_info = info
         step_record = self._environment.trajectory[-1]
         observation = str(step_record["environment_observation"])
-        if info["terminated"] or info["truncated"]:
-            return observation
-        return (
-            observation
-            + "\nCall `submit_navigation_decision` with the next canonical "
-            "<Think>/<Action> decision."
+        return _format_trl_navigation_tool_result(
+            observation,
+            episode_done=self.episode_done,
+            termination_reason=info.get("termination_reason"),
         )
 
 
@@ -582,32 +678,91 @@ def trl_environment_reward(
 def _tool_transcript_violations(
     completion: Any,
     *,
+    attempted_tool_calls: int,
     executed_tool_calls: int,
+    episode_done: bool,
 ) -> List[str]:
-    """Validate TRL's native tool envelope without re-scoring navigation."""
+    """Validate the ordered TRL tool transcript without re-scoring navigation."""
 
     if not isinstance(completion, Sequence) or isinstance(completion, str):
         return ["invalid_conversational_completion"]
 
     violations: List[str] = []
+    if (
+        attempted_tool_calls < 0
+        or executed_tool_calls < 0
+        or executed_tool_calls > attempted_tool_calls
+    ):
+        violations.append("invalid_tool_call_counters")
+
     native_tool_calls = 0
-    for message in completion:
+    navigation_tool_results = 0
+    outstanding_navigation_calls = 0
+    conversation_closed = False
+    final_single_navigation_call = False
+
+    for message_index, message in enumerate(completion):
         if not isinstance(message, Mapping):
             violations.append("invalid_completion_message")
             continue
-        if message.get("role") != "assistant":
+
+        role = message.get("role")
+        if conversation_closed:
+            violations.append("message_after_conversation_end")
+
+        if role == "tool":
+            final_single_navigation_call = False
+            if message.get("name") != "submit_navigation_decision":
+                violations.append("unexpected_tool_result")
+                continue
+            navigation_tool_results += 1
+            if outstanding_navigation_calls <= 0:
+                violations.append("tool_result_without_call")
+            else:
+                outstanding_navigation_calls -= 1
             continue
+
+        if role != "assistant":
+            violations.append("invalid_completion_role")
+            final_single_navigation_call = False
+            continue
+
+        if outstanding_navigation_calls > 0:
+            violations.append("missing_tool_result")
+
         raw_calls = message.get("tool_calls")
         if raw_calls is None:
+            conversation_closed = True
+            final_single_navigation_call = False
             continue
         if not isinstance(raw_calls, Sequence) or isinstance(raw_calls, str):
             violations.append("invalid_tool_call_envelope")
+            final_single_navigation_call = False
             continue
+        if not raw_calls:
+            conversation_closed = True
+            final_single_navigation_call = False
+            continue
+
+        content = message.get("content")
+        if content is not None and (
+            not isinstance(content, str) or bool(content.strip())
+        ):
+            violations.append("assistant_content_with_tool_call")
+        reasoning_content = message.get("reasoning_content")
+        if reasoning_content is not None and (
+            not isinstance(reasoning_content, str)
+            or bool(reasoning_content.strip())
+        ):
+            violations.append("assistant_reasoning_content_with_tool_call")
+
         navigation_calls = 0
         for call in raw_calls:
             if not isinstance(call, Mapping):
                 violations.append("invalid_tool_call_record")
                 continue
+            if call.get("type") != "function":
+                violations.append("invalid_tool_call_record")
             function = call.get("function", {})
             if not isinstance(function, Mapping):
                 violations.append("invalid_tool_function_record")
@@ -615,62 +770,58 @@ def _tool_transcript_violations(
             if function.get("name") == "submit_navigation_decision":
                 navigation_calls += 1
                 native_tool_calls += 1
+                arguments = function.get("arguments")
+                if (
+                    not isinstance(arguments, Mapping)
+                    or not isinstance(arguments.get("policy_output"), str)
+                ):
+                    violations.append("invalid_navigation_tool_arguments")
+            else:
+                violations.append("unexpected_tool_call")
         if navigation_calls > 1:
             violations.append("multiple_navigation_calls_in_one_turn")
-
-    # TRL may stop its native tool loop immediately after generating the
-    # next assistant tool call when max_tool_calling_iterations is reached.
-    # In that case the completion legitimately contains exactly one final
-    # navigation call that has no corresponding execution/tool result.
-    navigation_tool_results = sum(
-        1
-        for message in completion
-        if (
-            isinstance(message, Mapping)
-            and message.get("role") == "tool"
-            and message.get("name") == "submit_navigation_decision"
+        elif navigation_calls == 0:
+            violations.append("missing_navigation_call_in_tool_turn")
+        outstanding_navigation_calls += navigation_calls
+        final_single_navigation_call = (
+            navigation_calls == 1
+            and message_index == len(completion) - 1
         )
+
+    final_pending_navigation_call = (
+        outstanding_navigation_calls == 1
+        and final_single_navigation_call
     )
+    if outstanding_navigation_calls > 0 and not final_pending_navigation_call:
+        violations.append("missing_tool_result")
 
-    final_pending_navigation_call = False
-    if completion:
-        final_message = completion[-1]
-        if (
-            isinstance(final_message, Mapping)
-            and final_message.get("role") == "assistant"
-        ):
-            raw_calls = final_message.get("tool_calls")
-            if (
-                isinstance(raw_calls, Sequence)
-                and not isinstance(raw_calls, str)
-            ):
-                final_navigation_calls = 0
-                for call in raw_calls:
-                    if not isinstance(call, Mapping):
-                        continue
-                    function = call.get("function", {})
-                    if (
-                        isinstance(function, Mapping)
-                        and function.get("name")
-                        == "submit_navigation_decision"
-                    ):
-                        final_navigation_calls += 1
-                final_pending_navigation_call = (
-                    final_navigation_calls == 1
-                )
-
+    single_unexecuted_navigation_call = (
+        native_tool_calls == attempted_tool_calls + 1
+        and navigation_tool_results == attempted_tool_calls
+        and outstanding_navigation_calls == 1
+    )
     allowed_external_cutoff = (
-        native_tool_calls == executed_tool_calls + 1
-        and navigation_tool_results == executed_tool_calls
+        not episode_done
+        and attempted_tool_calls == executed_tool_calls
+        and single_unexecuted_navigation_call
         and final_pending_navigation_call
     )
 
+    if attempted_tool_calls != executed_tool_calls:
+        violations.append("tool_execution_count_mismatch")
+    if navigation_tool_results != attempted_tool_calls:
+        violations.append("tool_execution_count_mismatch")
     if (
-        native_tool_calls != executed_tool_calls
+        native_tool_calls != attempted_tool_calls
         and not allowed_external_cutoff
     ):
         violations.append("tool_execution_count_mismatch")
-    return violations
+    if episode_done and native_tool_calls > attempted_tool_calls:
+        violations.append("terminal_pending_tool_call")
+    if episode_done and attempted_tool_calls > executed_tool_calls:
+        violations.append("tool_call_after_episode_end")
+
+    return list(dict.fromkeys(violations))
 
 
 class NavGPTGymEnv(gym.Env):

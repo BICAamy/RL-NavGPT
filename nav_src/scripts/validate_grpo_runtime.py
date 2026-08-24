@@ -17,6 +17,7 @@ if str(NAV_SRC_DIR) not in sys.path:
 from action_plan_cache import canonical_json, sha256_text  # noqa: E402
 from grpo_runtime import (  # noqa: E402
     CHECKPOINT_MANIFEST_NAME,
+    GRPORuntimeError,
     IMPLEMENTATION_PATCH_LEDGER_NAME,
     RUN_MANIFEST_NAME,
     NavigationMetricsRecorder,
@@ -140,11 +141,16 @@ def transcript() -> list[dict[str, Any]]:
                     "type": "function",
                     "function": {
                         "name": "submit_navigation_decision",
-                        "arguments": "{}",
+                        "arguments": {"policy_output": "fixture"},
                     },
                 }
             ],
-        }
+        },
+        {
+            "role": "tool",
+            "name": "submit_navigation_decision",
+            "content": "fixture-result",
+        },
     ]
 
 
@@ -162,6 +168,352 @@ class FakeBaseTrainer:
 
     def is_world_process_zero(self) -> bool:
         return True
+
+    def _tool_call_loop(
+        self,
+        prompts,
+        prompt_ids,
+        completion_ids,
+        completions,
+        logprobs,
+        images,
+        multimodal_fields,
+    ):
+        raise AssertionError("The pinned fake base tool loop must be overridden")
+
+    def _get_tool_suffix_ids(self, tool_messages):
+        dummy_messages = [
+            {"role": "user", "content": "dummy"},
+            {"role": "assistant", "content": "dummy"},
+        ]
+        prefix_ids = self.processing_class.apply_chat_template(
+            dummy_messages,
+            add_generation_prompt=False,
+            chat_template=self.chat_template,
+            return_dict=False,
+            **self.chat_template_kwargs,
+        )
+        full_ids = self.processing_class.apply_chat_template(
+            dummy_messages + list(tool_messages),
+            add_generation_prompt=True,
+            chat_template=self.chat_template,
+            return_dict=False,
+            **self.chat_template_kwargs,
+        )
+        require(
+            full_ids[: len(prefix_ids)] == prefix_ids,
+            "Fake continuing suffix is not prefix preserving",
+        )
+        return full_ids[len(prefix_ids) :]
+
+
+class FakeToolLoopEnvironment:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self._done = False
+
+    @property
+    def episode_done(self) -> bool:
+        return self._done
+
+    @property
+    def last_info(self) -> dict[str, bool]:
+        return {"terminated": self._done, "truncated": False}
+
+    def submit_navigation_decision(self, policy_output: str) -> str:
+        self.calls.append(str(policy_output))
+        if str(policy_output).startswith("terminal"):
+            self._done = True
+            return f"terminal-result:{policy_output}"
+        return f"continue-result:{policy_output}"
+
+
+class FakeToolLoopProcessingClass:
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        add_generation_prompt,
+        chat_template,
+        return_dict,
+        **kwargs,
+    ):
+        del chat_template, return_dict, kwargs
+        ids = []
+        for message in messages:
+            role = message["role"]
+            if role == "user":
+                ids.append(10)
+            elif role == "assistant":
+                ids.append(20)
+            elif role == "tool":
+                ids.extend((30, 31))
+            else:
+                raise AssertionError(f"Unexpected fake chat role: {role}")
+        if add_generation_prompt:
+            ids.append(40)
+        return ids
+
+
+def assistant_tool_call(*policy_outputs: str) -> dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": f"call-{index}",
+                "type": "function",
+                "function": {
+                    "name": "submit_navigation_decision",
+                    "arguments": {"policy_output": policy_output},
+                },
+            }
+            for index, policy_output in enumerate(policy_outputs)
+        ],
+    }
+
+
+def make_tool_loop_trainer(
+    root: Path,
+    environments: list[FakeToolLoopEnvironment],
+    generated: list[tuple[list[list[int]], list[dict[str, Any]]]],
+    *,
+    max_iterations: int,
+):
+    recorder = NavigationMetricsRecorder(
+        str(root),
+        num_generations=2,
+        trajectory_log_interval=0,
+    )
+    trainer_cls = navigation_grpo_trainer_class(FakeBaseTrainer, recorder)
+    trainer = trainer_cls()
+    trainer.environments = environments
+    trainer._sync_tool_dicts = [
+        {
+            "submit_navigation_decision": (
+                environment.submit_navigation_decision
+            )
+        }
+        for environment in environments
+    ]
+    trainer._async_tool_dicts = [{} for _ in environments]
+    trainer.processing_class = FakeToolLoopProcessingClass()
+    trainer.chat_template = "fake-prefix-preserving-template"
+    trainer.chat_template_kwargs = {}
+    trainer.max_tool_calling_iterations = max_iterations
+    trainer.max_completion_length = 64
+    trainer.use_vllm = False
+    trainer.vllm_mode = "server"
+    trainer.model = SimpleNamespace(
+        config=SimpleNamespace(max_position_embeddings=512)
+    )
+    generation_calls = []
+    parse_by_ids = {}
+    pending = list(generated)
+
+    def generate_single_turn(prompt_batch, images, multimodal_fields):
+        require(bool(pending), "Unexpected post-terminal generation")
+        ids_batch, response_batch = pending.pop(0)
+        require(
+            len(ids_batch) == len(prompt_batch) == len(response_batch),
+            "Fake generation batch cardinality changed",
+        )
+        generation_calls.append(
+            {
+                "batch_size": len(prompt_batch),
+                "images": list(images) if images is not None else None,
+                "multimodal_fields": {
+                    name: list(values)
+                    for name, values in multimodal_fields.items()
+                },
+            }
+        )
+        for ids, response in zip(ids_batch, response_batch):
+            parse_by_ids[tuple(ids)] = response
+        return (
+            [list(ids) for ids in ids_batch],
+            [[float(ids[0]) / 100.0] * len(ids) for ids in ids_batch],
+            {},
+        )
+
+    trainer._generate_single_turn = generate_single_turn
+    trainer._navgpt_parse_tool_response = (
+        lambda ids: parse_by_ids[tuple(ids)]
+    )
+    return trainer, generation_calls, pending
+
+
+def validate_environment_aware_tool_loop(root: Path) -> None:
+    first = FakeToolLoopEnvironment()
+    second = FakeToolLoopEnvironment()
+    trainer, generation_calls, pending = make_tool_loop_trainer(
+        root / "mixed-tool-loop",
+        [first, second],
+        [
+            (
+                [[77]],
+                [assistant_tool_call("terminal-second")],
+            )
+        ],
+        max_iterations=10,
+    )
+    prompts = [
+        [{"role": "user", "content": "first"}],
+        [{"role": "user", "content": "second"}],
+    ]
+    result = trainer._tool_call_loop(
+        prompts,
+        [[1], [2]],
+        [[101], [102]],
+        [
+            [assistant_tool_call("terminal-first")],
+            [assistant_tool_call("continue-second")],
+        ],
+        [[0.1], [0.2]],
+        ["image-first", "image-second"],
+        {"fixture": ["field-first", "field-second"]},
+    )
+    tool_mask, completions, completion_ids, logprobs, calls, failures = result
+    require(not pending, "Scripted mixed-batch generation was not consumed")
+    require(calls == 3 and failures == 0, "Wrong mixed-batch tool counters")
+    require(
+        first.calls == ["terminal-first"],
+        "Terminal first sample executed or generated again",
+    )
+    require(
+        second.calls == ["continue-second", "terminal-second"],
+        "Continuing second sample lost its own tool sequence",
+    )
+    require(
+        generation_calls
+        == [
+            {
+                "batch_size": 1,
+                "images": ["image-second"],
+                "multimodal_fields": {"fixture": ["field-second"]},
+            }
+        ],
+        "Terminal filtering misaligned the mixed generation batch",
+    )
+    require(
+        [message["role"] for message in completions[0]]
+        == ["assistant", "tool"],
+        "First terminal transcript did not end with its tool result",
+    )
+    require(
+        [message["role"] for message in completions[1]]
+        == ["assistant", "tool", "assistant", "tool"],
+        "Second terminal transcript lost a turn",
+    )
+    require(
+        completion_ids == [
+            [101, 30, 31],
+            [102, 30, 31, 40, 77, 30, 31],
+        ],
+        "Terminal filtering changed model/tool completion IDs",
+    )
+    require(
+        tool_mask == [
+            [1, 0, 0],
+            [1, 0, 0, 0, 1, 0, 0],
+        ],
+        "Terminal tool-result tokens entered the policy mask",
+    )
+    require(
+        logprobs == [
+            [0.1, 0.0, 0.0],
+            [0.2, 0.0, 0.0, 0.0, 0.77, 0.0, 0.0],
+        ],
+        "Terminal tool-result logprob alignment changed",
+    )
+
+    multiple = FakeToolLoopEnvironment()
+    trainer, generation_calls, _ = make_tool_loop_trainer(
+        root / "multiple-tool-loop",
+        [multiple],
+        [],
+        max_iterations=10,
+    )
+    result = trainer._tool_call_loop(
+        [[{"role": "user", "content": "multiple"}]],
+        [[1]],
+        [[103]],
+        [
+            [
+                assistant_tool_call(
+                    "terminal-first-call",
+                    "must-not-execute",
+                )
+            ]
+        ],
+        [[0.3]],
+        None,
+        {},
+    )
+    require(
+        multiple.calls == ["terminal-first-call"],
+        "Second same-turn call executed after terminal",
+    )
+    require(not generation_calls, "Same-turn terminal generated another response")
+    require(result[4] == 1, "Skipped same-turn call changed the call counter")
+    require(
+        result[0] == [[1, 0, 0]] and result[2] == [[103, 30, 31]],
+        "Same-turn terminal lost its masked tool result",
+    )
+
+    cutoff = FakeToolLoopEnvironment()
+    trainer, generation_calls, pending = make_tool_loop_trainer(
+        root / "cutoff-tool-loop",
+        [cutoff],
+        [
+            (
+                [[88]],
+                [assistant_tool_call("pending-not-executed")],
+            )
+        ],
+        max_iterations=1,
+    )
+    result = trainer._tool_call_loop(
+        [[{"role": "user", "content": "cutoff"}]],
+        [[1]],
+        [[104]],
+        [[assistant_tool_call("continue-at-cap")]],
+        [[0.4]],
+        None,
+        {},
+    )
+    require(not pending and len(generation_calls) == 1, "Cutoff generation changed")
+    require(
+        cutoff.calls == ["continue-at-cap"],
+        "Final pending cutoff call was unexpectedly executed",
+    )
+    require(
+        [message["role"] for message in result[1][0]]
+        == ["assistant", "tool", "assistant"],
+        "Legal external-cutoff pending call was removed",
+    )
+    require(
+        result[0][0] == [1, 0, 0, 0, 1],
+        "External-cutoff model/tool mask changed",
+    )
+
+    class DriftedPrivateTrainer:
+        def _tool_call_loop(self, prompts):
+            del prompts
+
+    try:
+        navigation_grpo_trainer_class(
+            DriftedPrivateTrainer,
+            NavigationMetricsRecorder(
+                str(root / "drifted-tool-loop"),
+                num_generations=2,
+                trajectory_log_interval=0,
+            ),
+        )
+    except GRPORuntimeError:
+        pass
+    else:
+        raise AssertionError("Drifted private TRL tool-loop signature was accepted")
 
 
 def validate_logging(root: Path) -> None:
@@ -207,6 +559,22 @@ def validate_logging(root: Path) -> None:
     require(
         "nav/reward_component/thought/action_consistency" in metrics,
         "Thought reward component was not logged",
+    )
+    require(
+        metrics["nav/mean_attempted_tool_calls"]
+        == metrics["nav/mean_executed_tool_calls"]
+        == metrics["nav/mean_tool_calls"]
+        == 1.0,
+        "Attempted/executed/legacy tool-call metrics changed for clean rollouts",
+    )
+    require(
+        metrics["nav/protocol_violation/tool_call_after_episode_end"] == 0.0,
+        "The P0 post-terminal violation metric did not emit an explicit zero",
+    )
+    require(
+        metrics["nav/environment_termination/goal_reached"] == 0.5
+        and metrics["nav/environment_termination/max_steps"] == 0.5,
+        "Raw environment termination reasons were not logged",
     )
     require(
         all(
@@ -675,10 +1043,12 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="navgpt-grpo-runtime-") as value:
         root = Path(value)
         validate_logging(root)
+        validate_environment_aware_tool_loop(root)
         validate_run_manifest_model_binding(root)
         validate_checkpoint_contract(root)
     print("PASS stage-six logging and resume contract")
     print("- canonical reward unchanged; navigation metrics and compact traces logged")
+    print("- terminal-aware TRL tool loop preserves mixed-batch IDs and masks")
     print("- run identity is bound to exact local Qwen Safetensors weights")
     print(
         "- LoRA/ref plus optimizer, scheduler, FP16 scaler, RNG, "

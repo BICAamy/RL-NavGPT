@@ -1,15 +1,17 @@
 """Runtime logging and resumable LoRA checkpoints for stage-six GRPO.
 
-TRL remains responsible for rollout generation, GRPO loss computation, and
-the standard Trainer state.  This module adds navigation-specific observability
-and strict provenance around those standard mechanisms without serializing the
+TRL remains responsible for model generation, GRPO loss computation, and the
+standard Trainer state.  This module adds a pinned environment-terminal boundary,
+navigation-specific observability, and strict provenance without serializing the
 frozen Qwen backbone.
 """
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict, dataclass, is_dataclass
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -266,6 +268,26 @@ class NavigationMetricsRecorder:
                 1.0 if row["protocol_violations"] else 0.0 for row in rows
             ),
             "nav/mean_steps": _mean(rows, "step_count"),
+            "nav/mean_attempted_tool_calls": statistics.fmean(
+                float(
+                    row.get(
+                        "attempted_tool_call_count",
+                        row["tool_call_count"],
+                    )
+                )
+                for row in rows
+            ),
+            "nav/mean_executed_tool_calls": statistics.fmean(
+                float(
+                    row.get(
+                        "executed_tool_call_count",
+                        row["tool_call_count"],
+                    )
+                )
+                for row in rows
+            ),
+            # This schema-v2 metric retains its historical attempted-call
+            # meaning; use the explicit metric above for Gym dispatches.
             "nav/mean_tool_calls": _mean(rows, "tool_call_count"),
             "nav/final_distance_mean": _mean(rows, "distance_to_goal"),
             "nav/minimum_distance_mean": _mean(
@@ -301,6 +323,33 @@ class NavigationMetricsRecorder:
                 1.0 if str(row["termination_reason"]) == reason else 0.0
                 for row in rows
             )
+        violation_names = sorted(
+            {"tool_call_after_episode_end"}
+            | {
+                str(name)
+                for row in rows
+                for name in row["protocol_violations"]
+            }
+        )
+        for name in violation_names:
+            metrics[f"nav/protocol_violation/{name}"] = statistics.fmean(
+                1.0 if name in row["protocol_violations"] else 0.0
+                for row in rows
+            )
+        environment_termination_reasons = sorted(
+            {
+                str(row["environment_termination_reason"])
+                for row in rows
+                if row.get("environment_termination_reason") is not None
+            }
+        )
+        for reason in environment_termination_reasons:
+            metrics[f"nav/environment_termination/{reason}"] = statistics.fmean(
+                1.0
+                if str(row.get("environment_termination_reason")) == reason
+                else 0.0
+                for row in rows
+            )
         return metrics
 
 
@@ -330,13 +379,476 @@ def make_recording_environment_reward(
     return navigation_episode_reward
 
 
+_TRL_0291_TOOL_LOOP_PARAMETERS = (
+    "self",
+    "prompts",
+    "prompt_ids",
+    "completion_ids",
+    "completions",
+    "logprobs",
+    "images",
+    "multimodal_fields",
+)
+
+
+def _audit_trl_tool_loop_signature(base_trainer_cls: type) -> None:
+    """Fail closed if the pinned private TRL tool-loop boundary drifts."""
+
+    base_loop = getattr(base_trainer_cls, "_tool_call_loop", None)
+    if base_loop is None:
+        # Dependency-light contract tests use small trainer doubles.  The real
+        # builder separately requires trl==0.29.1 before reaching this point.
+        if str(getattr(base_trainer_cls, "__module__", "")).startswith("trl."):
+            raise GRPORuntimeError(
+                "Pinned TRL trainer no longer exposes _tool_call_loop"
+            )
+        return
+    actual = tuple(inspect.signature(base_loop).parameters)
+    if actual != _TRL_0291_TOOL_LOOP_PARAMETERS:
+        raise GRPORuntimeError(
+            "Pinned TRL _tool_call_loop signature changed: "
+            f"actual={actual}, expected={_TRL_0291_TOOL_LOOP_PARAMETERS}"
+        )
+
+
+def _navigation_environment_done(trainer: Any, index: int) -> bool:
+    """Read per-rollout terminal state without exposing another model tool."""
+
+    environments = getattr(trainer, "environments", None)
+    if environments is None:
+        return False
+    environment = environments[index]
+    done = getattr(environment, "episode_done", None)
+    if done is not None:
+        return bool(done)
+    # Keep the loop compatible with checkpoints created before episode_done was
+    # added.  NavGPTTRLEnvironment.last_info returns a defensive copy.
+    info = getattr(environment, "last_info", None) or {}
+    return bool(info.get("terminated", False) or info.get("truncated", False))
+
+
+def _terminal_tool_suffix_ids(
+    trainer: Any,
+    tool_messages: Sequence[Any],
+) -> List[int]:
+    """Render terminal tool results without a dangling assistant prompt."""
+
+    dummy_messages = [
+        {"role": "user", "content": "dummy"},
+        {"role": "assistant", "content": "dummy"},
+    ]
+    prefix_ids = trainer.processing_class.apply_chat_template(
+        dummy_messages,
+        add_generation_prompt=False,
+        chat_template=trainer.chat_template,
+        return_dict=False,
+        **trainer.chat_template_kwargs,
+    )
+    full_ids = trainer.processing_class.apply_chat_template(
+        dummy_messages + list(tool_messages),
+        add_generation_prompt=False,
+        chat_template=trainer.chat_template,
+        return_dict=False,
+        **trainer.chat_template_kwargs,
+    )
+    if full_ids[: len(prefix_ids)] != prefix_ids:
+        raise GRPORuntimeError(
+            "Terminal tool-result tokenization is not prefix preserving"
+        )
+    return list(full_ids[len(prefix_ids) :])
+
+
+def _parse_trl_tool_response(trainer: Any, token_ids: Sequence[int]) -> Dict[str, Any]:
+    """Use TRL's pinned parser, with an injectable dependency-light test hook."""
+
+    test_parser = getattr(trainer, "_navgpt_parse_tool_response", None)
+    if callable(test_parser):
+        return dict(test_parser(list(token_ids)))
+    from trl.chat_template_utils import parse_response
+
+    return dict(parse_response(trainer.processing_class, list(token_ids)))
+
+
+def _environment_aware_tool_call_loop(
+    self: Any,
+    prompts: List[Any],
+    prompt_ids: List[List[int]],
+    completion_ids: List[List[int]],
+    completions: List[List[Dict[str, Any]]],
+    logprobs: Optional[List[List[float]]],
+    images: Optional[Sequence[Any]],
+    multimodal_fields: Mapping[str, Sequence[Any]],
+):
+    """TRL 0.29.1 tool loop with per-environment terminal hard stops.
+
+    This deliberately retains TRL's generation, masking, length filtering, and
+    pending-call semantics.  The only behavioral boundary added here is that a
+    navigation rollout which becomes terminated/truncated is removed before
+    another generation or tool execution can occur.
+    """
+
+    tool_calls = [completion[0].get("tool_calls") for completion in completions]
+    idxs_with_tool = [
+        index for index, calls in enumerate(tool_calls) if calls
+    ]
+    tool_calls = [tool_calls[index] for index in idxs_with_tool]
+    tool_mask = [[1] * len(ids) for ids in completion_ids]
+    tool_call_count = 0
+    tool_failure_count = 0
+    iteration_num = 0
+
+    while idxs_with_tool and iteration_num < self.max_tool_calling_iterations:
+        # Defense in depth: a terminal environment must never enter tool
+        # dispatch, even if a caller supplied an already-pending assistant call.
+        active = [
+            (index, calls)
+            for index, calls in zip(idxs_with_tool, tool_calls, strict=True)
+            if not _navigation_environment_done(self, index)
+        ]
+        if not active:
+            break
+        idxs_with_tool = [index for index, _ in active]
+        tool_calls = [calls for _, calls in active]
+        prompt_completion_tools = [prompts[index] for index in idxs_with_tool]
+        terminal_after_tools: List[bool] = []
+
+        for local_index, idx_with_tool in enumerate(idxs_with_tool):
+            tool_call_list = tool_calls[local_index]
+            prompt_completion_tool = prompt_completion_tools[local_index]
+            sync_tool_dict = self._sync_tool_dicts[idx_with_tool]
+            async_tool_dict = self._async_tool_dicts[idx_with_tool]
+            prompt_completion_tool.append(completions[idx_with_tool][-1])
+            async_coros = []
+            tool_call_results = []
+
+            for tool_call in tool_call_list:
+                if _navigation_environment_done(self, idx_with_tool):
+                    break
+                tool_call_count += 1
+                if tool_call["type"] == "function":
+                    function = tool_call["function"]
+                    name = function["name"]
+                    try:
+                        if name in sync_tool_dict:
+                            result = sync_tool_dict[name](**function["arguments"])
+                            tool_call_results.append((name, result))
+                        elif name in async_tool_dict:
+                            async_coros.append(
+                                (
+                                    name,
+                                    async_tool_dict[name](
+                                        **function["arguments"]
+                                    ),
+                                )
+                            )
+                        else:
+                            raise ValueError(f"Tool {name} not found.")
+                    except Exception as exc:
+                        tool_failure_count += 1
+                        tool_call_results.append((name, {"error": str(exc)}))
+                else:
+                    tool_failure_count += 1
+                    name = tool_call.get("name", "unknown")
+                    tool_call_results.append(
+                        (
+                            name,
+                            {
+                                "error": "Unsupported tool call type: "
+                                f"{tool_call['type']}"
+                            },
+                        )
+                    )
+                # In particular, do not execute a second navigation call from
+                # the same assistant turn after the first one ends the episode.
+                if _navigation_environment_done(self, idx_with_tool):
+                    break
+
+            if async_coros:
+
+                async def _run_async_tools(coroutines):
+                    pending = [coroutine for _, coroutine in coroutines]
+                    results = await asyncio.gather(
+                        *pending,
+                        return_exceptions=True,
+                    )
+                    return [
+                        (name, result)
+                        for (name, _), result in zip(
+                            coroutines,
+                            results,
+                            strict=False,
+                        )
+                    ]
+
+                async_results = asyncio.run_coroutine_threadsafe(
+                    _run_async_tools(async_coros),
+                    self.async_loop,
+                ).result()
+                for name, result in async_results:
+                    if isinstance(result, Exception):
+                        tool_failure_count += 1
+                        tool_call_results.append((name, {"error": str(result)}))
+                    else:
+                        tool_call_results.append((name, result))
+
+            for name, result in tool_call_results:
+                tool_message = {
+                    "role": "tool",
+                    "name": name,
+                    "content": str(result),
+                }
+                prompt_completion_tool.append(tool_message)
+                completions[idx_with_tool].append(tool_message)
+            terminal_after_tools.append(
+                _navigation_environment_done(self, idx_with_tool)
+            )
+
+        prompt_completion_tool_ids: List[List[int]] = []
+        for local_index, idx_with_tool in enumerate(idxs_with_tool):
+            tool_messages = []
+            for message in reversed(completions[idx_with_tool]):
+                if message["role"] == "tool":
+                    tool_messages.insert(0, message)
+                else:
+                    break
+            if terminal_after_tools[local_index]:
+                suffix_ids = _terminal_tool_suffix_ids(self, tool_messages)
+            else:
+                suffix_ids = self._get_tool_suffix_ids(tool_messages)
+            prompt_completion_tool_ids.append(
+                prompt_ids[idx_with_tool]
+                + completion_ids[idx_with_tool]
+                + suffix_ids
+            )
+
+        if self.use_vllm and self.vllm_mode == "colocate":
+            max_model_len = (
+                self.vllm_generation.llm.llm_engine.model_config.max_model_len
+            )
+        elif not self.use_vllm:
+            max_model_len = self.model.config.max_position_embeddings
+        else:
+            raise NotImplementedError(
+                "Unsupported mode detected: "
+                f"use_vllm={self.use_vllm}, vllm_mode={self.vllm_mode}"
+            )
+        overlong = [
+            len(prompt_completion) >= max_model_len
+            for prompt_completion in prompt_completion_tool_ids
+        ]
+        for local_index, idx_with_tool in enumerate(idxs_with_tool):
+            if not overlong[local_index]:
+                continue
+            prompt_length = len(prompt_ids[idx_with_tool])
+            completion_tool = prompt_completion_tool_ids[local_index][
+                prompt_length : prompt_length + self.max_completion_length
+            ]
+            previous_length = min(
+                len(completion_ids[idx_with_tool]),
+                len(completion_tool),
+            )
+            completion_ids[idx_with_tool] = completion_tool
+            added_length = len(completion_tool) - previous_length
+            if terminal_after_tools[local_index]:
+                tool_mask[idx_with_tool] = (
+                    tool_mask[idx_with_tool][:previous_length]
+                    + [0] * added_length
+                )
+                if logprobs is not None:
+                    logprobs[idx_with_tool] = (
+                        logprobs[idx_with_tool][:previous_length]
+                        + [0.0] * added_length
+                    )
+            else:
+                # Retain TRL 0.29.1's existing overlong behavior literally for
+                # non-terminal samples; this patch changes only terminal flow.
+                tool_mask[idx_with_tool] += [1] * (
+                    len(completion_tool) - len(tool_mask[idx_with_tool])
+                )
+                if logprobs is not None:
+                    logprobs[idx_with_tool] += [0.0] * (
+                        len(completion_tool) - len(logprobs[idx_with_tool])
+                    )
+
+        survivors = [
+            (
+                index,
+                prompt_completion,
+                prompt_messages,
+                terminal,
+            )
+            for index, prompt_completion, prompt_messages, terminal, is_overlong
+            in zip(
+                idxs_with_tool,
+                prompt_completion_tool_ids,
+                prompt_completion_tools,
+                terminal_after_tools,
+                overlong,
+                strict=True,
+            )
+            if not is_overlong
+        ]
+        if not survivors:
+            break
+
+        continuing = []
+        for (
+            idx_with_tool,
+            prompt_completion,
+            prompt_messages,
+            terminal,
+        ) in survivors:
+            if not terminal:
+                continuing.append(
+                    (idx_with_tool, prompt_completion, prompt_messages)
+                )
+                continue
+
+            prompt_length = len(prompt_ids[idx_with_tool])
+            completion_tool = prompt_completion[
+                prompt_length : prompt_length + self.max_completion_length
+            ]
+            previous_length = min(
+                len(completion_ids[idx_with_tool]),
+                len(completion_tool),
+            )
+            completion_ids[idx_with_tool] = completion_tool
+            tool_mask[idx_with_tool] = (
+                tool_mask[idx_with_tool][:previous_length]
+                + [0] * (len(completion_tool) - previous_length)
+            )
+            if logprobs is not None:
+                logprobs[idx_with_tool] = (
+                    logprobs[idx_with_tool][:previous_length]
+                    + [0.0] * (len(completion_tool) - previous_length)
+                )
+
+        if not continuing:
+            break
+
+        idxs_with_tool = [index for index, _, _ in continuing]
+        prompt_completion_tool_ids = [value for _, value, _ in continuing]
+        prompt_completion_tools = [value for _, _, value in continuing]
+        loop_images = (
+            [images[index] for index in idxs_with_tool] if images else None
+        )
+        loop_multimodal_fields = (
+            {
+                name: [values[index] for index in idxs_with_tool]
+                for name, values in multimodal_fields.items()
+            }
+            if multimodal_fields
+            else {}
+        )
+
+        post_tool_ids, post_tool_logprobs, _ = self._generate_single_turn(
+            prompt_completion_tool_ids,
+            loop_images,
+            loop_multimodal_fields,
+        )
+        for local_index, idx_with_tool in enumerate(idxs_with_tool):
+            prompt_length = len(prompt_ids[idx_with_tool])
+            completion_tool_ids = prompt_completion_tool_ids[local_index][
+                prompt_length:
+            ]
+            excess_length = (
+                len(completion_tool_ids)
+                + len(post_tool_ids[local_index])
+                - self.max_completion_length
+            )
+            if excess_length > 0:
+                post_tool_ids[local_index] = post_tool_ids[local_index][
+                    :-excess_length
+                ]
+                if logprobs is not None:
+                    post_tool_logprobs[local_index] = post_tool_logprobs[
+                        local_index
+                    ][:-excess_length]
+                excess_length = (
+                    len(completion_tool_ids)
+                    + len(post_tool_ids[local_index])
+                    - self.max_completion_length
+                )
+                if excess_length > 0:
+                    prompt_completion_tool_ids[local_index] = (
+                        prompt_completion_tool_ids[local_index][:-excess_length]
+                    )
+
+        for local_index, idx_with_tool in enumerate(idxs_with_tool):
+            prompt_completion_length = len(
+                prompt_completion_tool_ids[local_index]
+            )
+            prompt_length = len(prompt_ids[idx_with_tool])
+            completion_length = len(completion_ids[idx_with_tool])
+            post_tool_length = len(post_tool_ids[local_index])
+            tool_length = (
+                prompt_completion_length
+                - prompt_length
+                - completion_length
+            )
+            tool_mask[idx_with_tool] += (
+                [0] * tool_length + [1] * post_tool_length
+            )
+            if logprobs is not None:
+                logprobs[idx_with_tool] += (
+                    [0.0] * tool_length + post_tool_logprobs[local_index]
+                )
+
+        for local_index, idx_with_tool in enumerate(idxs_with_tool):
+            prompt_length = len(prompt_ids[idx_with_tool])
+            prompt_completion = prompt_completion_tool_ids[local_index]
+            completion_ids[idx_with_tool] = (
+                prompt_completion[prompt_length:] + post_tool_ids[local_index]
+            )
+
+        post_tool_completions = [
+            _parse_trl_tool_response(self, ids) if ids else {}
+            for ids in post_tool_ids
+        ]
+        for local_index, idx_with_tool in enumerate(idxs_with_tool):
+            if post_tool_completions[local_index]:
+                completions[idx_with_tool].append(
+                    post_tool_completions[local_index]
+                )
+
+        next_calls = [
+            completion.get("tool_calls")
+            for completion in post_tool_completions
+        ]
+        active = [
+            (index, calls)
+            for index, calls in zip(
+                idxs_with_tool,
+                next_calls,
+                strict=True,
+            )
+            if calls
+        ]
+        idxs_with_tool = [index for index, _ in active]
+        tool_calls = [calls for _, calls in active]
+        iteration_num += 1
+
+    return (
+        tool_mask,
+        completions,
+        completion_ids,
+        logprobs,
+        tool_call_count,
+        tool_failure_count,
+    )
+
+
 def navigation_grpo_trainer_class(
     base_trainer_cls: type,
     recorder: NavigationMetricsRecorder,
 ) -> type:
-    """Return a GRPOTrainer subclass that merges navigation metrics at log()."""
+    """Return a pinned TRL subclass with navigation stop and log contracts."""
+
+    _audit_trl_tool_loop_signature(base_trainer_cls)
 
     class NavigationGRPOTrainer(base_trainer_cls):
+        _tool_call_loop = _environment_aware_tool_call_loop
+
         def log(
             self,
             logs: Mapping[str, float],

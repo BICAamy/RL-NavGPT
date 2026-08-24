@@ -50,6 +50,7 @@ from navigation_rewards import (  # noqa: E402
 )
 from rl_env import (  # noqa: E402
     NavGPTTRLEnvironment,
+    format_trl_navigation_observation,
     trl_environment_reward,
 )
 
@@ -284,6 +285,41 @@ class FakeGymEpisode:
         return self.episode_return
 
 
+class FakeToolGymEpisode:
+    """Minimal Gym side used to validate TRL tool-result termination text."""
+
+    def __init__(
+        self,
+        *,
+        terminated: bool = False,
+        truncated: bool = False,
+        termination_reason: str | None = None,
+    ):
+        self.terminated = bool(terminated)
+        self.truncated = bool(truncated)
+        self.termination_reason = termination_reason
+        self.trajectory: list[dict[str, Any]] = []
+
+    def step(self, policy_output: str):
+        del policy_output
+        episode_done = self.terminated or self.truncated
+        info = {
+            "terminated": self.terminated,
+            "truncated": self.truncated,
+            "termination_reason": self.termination_reason,
+        }
+        self.trajectory.append(
+            {
+                "environment_observation": (
+                    "Terminal observation."
+                    if episode_done
+                    else "Next observation."
+                )
+            }
+        )
+        return "prompt", 0.0, self.terminated, self.truncated, info
+
+
 class FakeParameter:
     def __init__(self, size: int, *, requires_grad: bool):
         self.size = size
@@ -507,23 +543,77 @@ def validate_component_assembly() -> Any:
     return components
 
 
-def transcript(tool_call_count: int) -> list[dict[str, Any]]:
+def navigation_tool_call(index: int) -> dict[str, Any]:
+    return {
+        "id": f"call-{index}",
+        "type": "function",
+        "function": {
+            "name": "submit_navigation_decision",
+            "arguments": {"policy_output": "..."},
+        },
+    }
+
+
+def transcript(
+    tool_call_count: int,
+    *,
+    pending: bool = False,
+    close_conversation: bool = False,
+) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    for index in range(tool_call_count):
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [navigation_tool_call(index)],
+                },
+                {
+                    "role": "tool",
+                    "name": "submit_navigation_decision",
+                    "tool_call_id": f"call-{index}",
+                    "content": "Synthetic environment observation.",
+                },
+            ]
+        )
+    if pending:
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [navigation_tool_call(tool_call_count)],
+            }
+        )
+    elif close_conversation:
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "Episode complete.",
+            }
+        )
+    return messages
+
+
+def multiple_navigation_call_transcript() -> list[dict[str, Any]]:
     return [
         {
             "role": "assistant",
             "content": "",
-            "tool_calls": [
-                {
-                    "id": f"call-{index}",
-                    "type": "function",
-                    "function": {
-                        "name": "submit_navigation_decision",
-                        "arguments": '{"policy_output":"..."}',
-                    },
-                }
-                for index in range(tool_call_count)
-            ],
-        }
+            "tool_calls": [navigation_tool_call(0), navigation_tool_call(1)],
+        },
+        {
+            "role": "tool",
+            "name": "submit_navigation_decision",
+            "tool_call_id": "call-0",
+            "content": "First result.",
+        },
+        {
+            "role": "tool",
+            "name": "submit_navigation_decision",
+            "tool_call_id": "call-1",
+            "content": "Second result.",
+        },
     ]
 
 
@@ -545,6 +635,7 @@ def make_trl_environment(
         terminal_outcome=terminal_outcome,
     )
     environment._tool_call_count = tool_call_count
+    environment._attempted_tool_call_count = tool_call_count
     environment._last_info = {
         "instr_id": "17DRP5sb8fy_0_0",
         "terminated": terminated,
@@ -574,6 +665,66 @@ def validate_environment_finalization() -> None:
         f"TRL would expose unexpected model tools: {sorted(public_methods)}",
     )
 
+    protocol_prompt = format_trl_navigation_observation("Policy prompt.")
+    require(
+        "After each non-terminal tool result" in protocol_prompt
+        and "terminated or truncated" in protocol_prompt
+        and "do not call any tool again" in protocol_prompt,
+        "TRL protocol does not distinguish terminal and non-terminal results",
+    )
+
+    nonterminal_adapter = NavGPTTRLEnvironment(None)  # type: ignore[arg-type]
+    nonterminal_adapter._environment = FakeToolGymEpisode()
+    nonterminal_adapter._last_info = {
+        "terminated": False,
+        "truncated": False,
+        "termination_reason": None,
+    }
+    nonterminal_result = nonterminal_adapter.submit_navigation_decision("move")
+    require(
+        "Call `submit_navigation_decision` with the next canonical" in nonterminal_result
+        and "DO NOT call" not in nonterminal_result,
+        "Non-terminal tool result has the wrong continuation suffix",
+    )
+    require(not nonterminal_adapter.episode_done, "Non-terminal adapter is done")
+    require(
+        nonterminal_adapter.attempted_tool_call_count
+        == nonterminal_adapter.executed_tool_call_count
+        == 1,
+        "Normal tool call counters differ",
+    )
+
+    terminal_cases = (
+        FakeToolGymEpisode(
+            terminated=True,
+            termination_reason="goal_reached",
+        ),
+        FakeToolGymEpisode(
+            terminated=True,
+            termination_reason="premature_finish",
+        ),
+        FakeToolGymEpisode(
+            truncated=True,
+            termination_reason="max_steps",
+        ),
+    )
+    for terminal_episode in terminal_cases:
+        terminal_adapter = NavGPTTRLEnvironment(None)  # type: ignore[arg-type]
+        terminal_adapter._environment = terminal_episode
+        terminal_adapter._last_info = {
+            "terminated": False,
+            "truncated": False,
+            "termination_reason": None,
+        }
+        terminal_result = terminal_adapter.submit_navigation_decision("finish")
+        require(
+            "Episode terminated/truncated" in terminal_result
+            and f"reason `{terminal_episode.termination_reason}`" in terminal_result
+            and "DO NOT call `submit_navigation_decision`" in terminal_result,
+            "Terminal tool result omitted its reason or stop suffix",
+        )
+        require(terminal_adapter.episode_done, "Terminal adapter is not done")
+
     incomplete = make_trl_environment(
         episode_return=12.0,
         terminated=False,
@@ -586,6 +737,13 @@ def validate_environment_finalization() -> None:
     require(reward < -80.0, "External cutoff crossed the failure ceiling")
     require(reward != -80.0, "External cutoff collapsed to the hard ceiling")
     require(summary is not None, "Finalization summary was not recorded")
+    require(
+        summary.attempted_tool_call_count
+        == summary.executed_tool_call_count
+        == summary.tool_call_count
+        == 1,
+        "Finalization changed compatible tool-call count semantics",
+    )
     require(summary.raw_episode_return == 12.0, "Raw reward was overwritten")
     require(
         summary.external_cutoff_adjustment == reward - 12.0,
@@ -601,6 +759,25 @@ def validate_environment_finalization() -> None:
         trl_environment_reward([incomplete], completions=[transcript(1)])
         == [reward],
         "Finalization is not idempotent",
+    )
+
+    pending_cutoff = make_trl_environment(
+        episode_return=12.0,
+        terminated=False,
+        truncated=False,
+        success=False,
+        tool_call_count=1,
+    )
+    pending_reward = trl_environment_reward(
+        [pending_cutoff],
+        completions=[transcript(1, pending=True)],
+    )[0]
+    pending_summary = pending_cutoff.rollout_summary
+    require(pending_reward < -80.0, "Pending cutoff escaped failure shaping")
+    require(
+        pending_summary is not None
+        and pending_summary.protocol_violations == (),
+        "Legal non-terminal final pending call was marked invalid",
     )
 
     grouped_failures = [
@@ -625,12 +802,19 @@ def validate_environment_finalization() -> None:
         tool_call_count=1,
     )
     require(
-        trl_environment_reward([success], completions=[transcript(1)])
+        trl_environment_reward(
+            [success],
+            completions=[transcript(1, close_conversation=True)],
+        )
         == [206.5],
         "Valid terminal reward was modified",
     )
     success_summary = success.rollout_summary
     require(success_summary is not None and success_summary.success, "Lost success")
+    require(
+        success_summary.environment_termination_reason == "goal_reached",
+        "Raw environment termination reason was not preserved",
+    )
     require(
         success_summary.component_totals
         == {
@@ -639,6 +823,40 @@ def validate_environment_finalization() -> None:
             "semantic/alignment_delta": 1.5,
         },
         "Finalization lost reward component totals",
+    )
+    try:
+        success.submit_navigation_decision("after-finalize")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("A finalized rollout accepted another tool invocation")
+
+    provisional = make_trl_environment(
+        episode_return=206.5,
+        terminated=True,
+        truncated=False,
+        success=True,
+        tool_call_count=1,
+    )
+    require(
+        provisional._get_accumulated_reward() == 206.5
+        and provisional.rollout_summary is None,
+        "A completion-free reward read permanently bypassed transcript audit",
+    )
+    content_completion = transcript(1)
+    content_completion[0]["content"] = "ordinary assistant decision"
+    require(
+        trl_environment_reward(
+            [provisional],
+            completions=[content_completion],
+        )[0]
+        < -80.0,
+        "Assistant content outside policy_output retained terminal success",
+    )
+    require(
+        "assistant_content_with_tool_call"
+        in provisional.rollout_summary.protocol_violations,
+        "Assistant content in a tool-call turn was not diagnosed",
     )
 
     violation = make_trl_environment(
@@ -649,7 +867,7 @@ def validate_environment_finalization() -> None:
         tool_call_count=2,
     )
     violation_reward = trl_environment_reward(
-        [violation], completions=[transcript(2)]
+        [violation], completions=[multiple_navigation_call_transcript()]
     )[0]
     require(
         violation_reward < -80.0,
@@ -663,6 +881,96 @@ def validate_environment_finalization() -> None:
         "Multiple navigation calls were not detected",
     )
     require(not violation_summary.success, "Protocol violation remained successful")
+
+    malformed_completion = transcript(1)
+    malformed_call = malformed_completion[0]["tool_calls"][0]
+    malformed_call["type"] = "custom"
+    malformed_call["function"]["arguments"] = '{"policy_output":"..."}'
+    malformed = make_trl_environment(
+        episode_return=206.5,
+        terminated=True,
+        truncated=False,
+        success=True,
+        tool_call_count=1,
+    )
+    malformed_reward = trl_environment_reward(
+        [malformed],
+        completions=[malformed_completion],
+    )[0]
+    malformed_summary = malformed.rollout_summary
+    require(malformed_reward < -80.0, "Malformed tool envelope retained success")
+    require(
+        malformed_summary is not None
+        and "invalid_tool_call_record"
+        in malformed_summary.protocol_violations
+        and "invalid_navigation_tool_arguments"
+        in malformed_summary.protocol_violations,
+        "Tool type or navigation arguments were not validated strictly",
+    )
+
+    terminal_pending = make_trl_environment(
+        episode_return=206.5,
+        terminated=True,
+        truncated=False,
+        success=True,
+        tool_call_count=1,
+    )
+    terminal_pending_reward = trl_environment_reward(
+        [terminal_pending],
+        completions=[transcript(1, pending=True)],
+    )[0]
+    terminal_pending_summary = terminal_pending.rollout_summary
+    require(
+        terminal_pending_reward < -80.0,
+        "Terminal pending tool call retained success reward",
+    )
+    require(
+        terminal_pending_summary is not None
+        and "terminal_pending_tool_call"
+        in terminal_pending_summary.protocol_violations,
+        "Terminal pending tool call was mistaken for an external cutoff",
+    )
+    require(
+        "tool_call_after_episode_end"
+        not in terminal_pending_summary.protocol_violations,
+        "A guarded terminal pending call was counted as an attempted call",
+    )
+
+    terminal_called_again = make_trl_environment(
+        episode_return=206.5,
+        terminated=True,
+        truncated=False,
+        success=True,
+        tool_call_count=1,
+    )
+    rejected_result = terminal_called_again.submit_navigation_decision("again")
+    require(
+        "DO NOT call `submit_navigation_decision`" in rejected_result,
+        "Rejected post-terminal call omitted the terminal suffix",
+    )
+    require(
+        terminal_called_again.attempted_tool_call_count == 2
+        and terminal_called_again.executed_tool_call_count == 1,
+        "Rejected post-terminal call changed executed-call compatibility",
+    )
+    post_terminal_reward = trl_environment_reward(
+        [terminal_called_again],
+        completions=[transcript(2, close_conversation=True)],
+    )[0]
+    post_terminal_summary = terminal_called_again.rollout_summary
+    require(post_terminal_reward < -80.0, "Post-terminal call retained success")
+    require(
+        post_terminal_summary is not None
+        and "tool_call_after_episode_end" in post_terminal_summary.protocol_violations,
+        "Executed post-terminal tool invocation was not recorded",
+    )
+    require(
+        post_terminal_summary.tool_call_count
+        == post_terminal_summary.attempted_tool_call_count
+        == 2
+        and post_terminal_summary.executed_tool_call_count == 1,
+        "Schema-v2 tool_call_count no longer preserves attempted-call semantics",
+    )
 
     try:
         trl_environment_reward(
