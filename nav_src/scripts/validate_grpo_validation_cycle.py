@@ -23,6 +23,7 @@ from action_plan_cache import (  # noqa: E402
     load_action_plan_cache,
     load_annotation_instructions,
     sha256_file,
+    sha256_text,
     validate_cache_against_annotation,
 )
 from grpo_eval_artifacts import (  # noqa: E402
@@ -33,6 +34,7 @@ from grpo_runtime import (  # noqa: E402
     CHECKPOINT_MANIFEST_NAME,
     SESSION_LOG_NAME,
 )
+from r2r_evaluation import load_official_native_manifest  # noqa: E402
 
 
 def require(condition: bool, message: str) -> None:
@@ -331,10 +333,20 @@ def _assert_final_state(
         len(queue["events"]) == 3,
         f"Expected two fast events and one epoch event: {queue['events']}",
     )
+    full_ids = tuple(
+        str(row["instr_id"])
+        for row in load_annotation_instructions(
+            root / "fixture/val_unseen_fixture.json"
+        )
+    )
+    fast_subset = _read_json(root / "fixture/fast_subset.json")
+    fast_ids = tuple(str(value) for value in fast_subset["instr_ids"])
+    protocol_fingerprints = set()
     for job in queue["jobs"]:
         expected_count = (
             args.fast_subset_size if job["mode"] == "fast" else args.fixture_size
         )
+        expected_ids = fast_ids if job["mode"] == "fast" else full_ids
         require(
             int(job["result"]["count"]) == expected_count,
             f"Evaluation coverage changed: {job['job_id']}",
@@ -345,11 +357,33 @@ def _assert_final_state(
             isinstance(predictions, list) and len(predictions) == expected_count,
             f"Merged predictions are incomplete: {job['job_id']}",
         )
+        actual_ids = tuple(str(row["instr_id"]) for row in predictions)
         require(
-            len({str(row["instr_id"]) for row in predictions})
-            == expected_count,
-            f"Merged predictions contain duplicates: {job['job_id']}",
+            actual_ids == expected_ids
+            and sha256_text(canonical_json(list(actual_ids)))
+            == sha256_text(canonical_json(list(expected_ids))),
+            f"Merged prediction order/coverage changed: {job['job_id']}",
         )
+        evaluation_manifest = load_official_native_manifest(
+            str(job["output_path"])
+        )
+        require(
+            evaluation_manifest["job_id"] == job["job_id"]
+            and evaluation_manifest["mode"] == job["mode"]
+            and int(evaluation_manifest["step"]) == int(job["step"])
+            and evaluation_manifest["snapshot_fingerprint"]
+            == job["snapshot"]["fingerprint"]
+            and evaluation_manifest["policy_fingerprint"]
+            == job["result"]["policy_fingerprint"],
+            f"Evaluation provenance changed: {job['job_id']}",
+        )
+        protocol_fingerprints.add(
+            str(evaluation_manifest["protocol_fingerprint"])
+        )
+    require(
+        len(protocol_fingerprints) == 1,
+        f"Fast/full jobs did not share one native protocol: {protocol_fingerprints}",
+    )
     fast_steps = [int(row["step"]) for row in state["fast_history"]]
     require(fast_steps == [1, 2], f"Unexpected fast history: {fast_steps}")
     require(len(state["epoch_history"]) == 1, "Epoch-end selection did not run")

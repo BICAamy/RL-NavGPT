@@ -41,7 +41,10 @@ from grpo_validation import (  # noqa: E402
     GRPOValidationManager,
     prepare_validation_contract,
 )
-from r2r_evaluation import R2REvaluationConfig  # noqa: E402
+from r2r_evaluation import (  # noqa: E402
+    DEFAULT_NATIVE_MAX_NEW_TOKENS,
+    R2REvaluationConfig,
+)
 
 
 def main() -> None:
@@ -239,6 +242,36 @@ def build_validation_config(
 ) -> GRPOValidationConfig | None:
     if not args.validation:
         return None
+    validation_max_new_tokens = args.validation_max_new_tokens
+    if args.resume_from_checkpoint is not None:
+        recorded = load_grpo_run_manifest(args.output_dir)
+        validation = recorded.get("validation", {})
+        evaluation = validation.get("evaluation", {})
+        recorded_max_new_tokens = evaluation.get("max_new_tokens")
+        if recorded_max_new_tokens is None:
+            raise ValueError(
+                "Resumed run has no recorded validation max_new_tokens"
+            )
+        if (
+            validation_max_new_tokens is not None
+            and int(validation_max_new_tokens) != int(recorded_max_new_tokens)
+        ):
+            raise ValueError(
+                "Checkpoint resume must retain its recorded validation "
+                f"max_new_tokens={recorded_max_new_tokens}, received "
+                f"{validation_max_new_tokens}"
+            )
+        validation_max_new_tokens = recorded_max_new_tokens
+    if validation_max_new_tokens is None:
+        validation_max_new_tokens = DEFAULT_NATIVE_MAX_NEW_TOKENS
+    if (
+        args.resume_from_checkpoint is None
+        and int(validation_max_new_tokens) != DEFAULT_NATIVE_MAX_NEW_TOKENS
+    ):
+        raise ValueError(
+            "New training runs must use the formal validation "
+            f"max_new_tokens={DEFAULT_NATIVE_MAX_NEW_TOKENS}"
+        )
     return GRPOValidationConfig(
         evaluation=R2REvaluationConfig(
             annotation=args.validation_annotation,
@@ -251,7 +284,7 @@ def build_validation_config(
             expected_instruction_count=args.validation_expected_instruction_count,
             max_navigation_steps=args.max_navigation_steps,
             max_tool_calling_iterations=args.max_tool_calling_iterations,
-            max_new_tokens=args.validation_max_new_tokens,
+            max_new_tokens=int(validation_max_new_tokens),
             seed=args.validation_seed,
         ),
         fast_subset_manifest=args.validation_fast_subset_manifest,
@@ -503,7 +536,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1_000,
     )
-    parser.add_argument("--validation-max-new-tokens", type=int, default=512)
+    parser.add_argument(
+        "--validation-max-new-tokens",
+        type=int,
+        default=None,
+        help=(
+            "new runs default to the formal 256-token protocol; checkpoint "
+            "resume inherits the immutable recorded value when omitted"
+        ),
+    )
     parser.add_argument("--validation-seed", type=int, default=0)
     parser.add_argument("--validation-progress-interval", type=int, default=10)
     parser.add_argument(

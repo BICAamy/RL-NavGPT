@@ -60,6 +60,19 @@ def require(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+def validate_environment_tool_surface() -> None:
+    environment = NavGPTTRLEnvironment(None)
+    public_tools = {
+        name
+        for name, method in inspect.getmembers(environment, predicate=inspect.ismethod)
+        if name != "reset" and not name.startswith("_")
+    }
+    require(
+        public_tools == {NAVIGATION_TOOL},
+        f"TRL would expose unexpected environment tools: {sorted(public_tools)}",
+    )
+
+
 def navigation_call(*policy_outputs: str) -> Dict[str, Any]:
     return {
         "role": "assistant",
@@ -872,6 +885,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     validate_locked_dependencies()
+    validate_environment_tool_surface()
     validate_transcript_state_machine()
     validate_terminal_suffix_tail_guard()
     validate_protocol_suite(PinnedTrainerDouble)
@@ -882,6 +896,7 @@ def main() -> None:
     print("- terminal template whitespace after EOS is removed fail-closed")
     print("- terminal pending/actual calls; mixed batch; multiple calls")
     print("- strict assistant/tool pairing; orphan, missing, and unknown records")
+    print("- environment exposes exactly one public model tool")
     print("- pinned eight-parameter input and six-value output boundary")
     if args.real_trl:
         validate_real_trl()

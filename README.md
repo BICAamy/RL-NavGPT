@@ -119,12 +119,45 @@ python NavGPT.py --llm_backend openai `
 
 ### 🥢 Local HF and GGUF backends
 
-The current code supports `--llm_backend openai`, `hf`, and `gguf`. All three
-use the same `<Think>/<Action>` navigation protocol. HF models use the
-tokenizer's native `apply_chat_template()`; GGUF models use llama.cpp chat
-completion or plain completion according to `--local_chat_template`.
+`NavGPT.py` supports `--llm_backend openai`, `hf`, and `gguf` for reproducing
+the historical LangChain `<Think>/<Action>` system. This entry point is a
+legacy evaluator: its output manifest records
+`evaluator_family=legacy_langchain` and `official_rl_comparable=false`.
+It remains useful for the original OpenAI-system baseline, but it is not the
+formal evaluator for the GRPO policy.
 
-See [docs/运行命令.md](docs/运行命令.md) for complete commands and
+Formal Base-Qwen and Base-Qwen+LoRA evaluation uses the single native tool-call
+entry point instead (run from the repository root):
+
+```bash
+PYTHONNOUSERSITE=1 CUDA_VISIBLE_DEVICES=0 \
+python nav_src/scripts/evaluate_r2r_native.py \
+  --policy-kind base \
+  --model-path models/Qwen2.5-14B-Instruct-1M \
+  --candidate-label base-qwen \
+  --output-dir outputs/native-eval/base-val-unseen \
+  --max-new-tokens 256
+
+PYTHONNOUSERSITE=1 CUDA_VISIBLE_DEVICES=0 \
+python nav_src/scripts/evaluate_r2r_native.py \
+  --policy-kind adapter \
+  --model-path models/Qwen2.5-14B-Instruct-1M \
+  --adapter-path outputs/<run>/validation/snapshots/step-375 \
+  --candidate-label rl-lora-step-375 \
+  --output-dir outputs/native-eval/rl-lora-step-375-val-unseen \
+  --max-new-tokens 256
+```
+
+The two formal runs must keep the same dataset paths and protocol arguments;
+only the adapter may differ. Historical evaluator results generated with a
+512-token decision budget use an old protocol and are not directly comparable
+with the fixed 256-token protocol. `--full-best-run-dir` is accepted only for
+a future training run whose completed full validation already carries this
+same native 256-token/2349-item protocol; use an explicit immutable snapshot
+for historical runs.
+
+See [docs/训练命令.md](docs/训练命令.md#121-唯一正式-native-evaluator) for the
+complete four-GPU Base/step-375/step-750 protocol and
 [docs/parse中的参数解析.md](docs/parse中的参数解析.md) for CLI options.
 
 ## 🧃 Citation

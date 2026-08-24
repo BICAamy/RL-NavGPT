@@ -221,6 +221,7 @@ class NavGPTEnvironmentFactory:
         prompt_config: Optional[NavigationPromptConfig] = None,
         navigation_input_mode: str = "action_plan",
         max_steps: int = 10,
+        seed: int = 0,
         success_distance: float = ERROR_MARGIN,
         reward_calculator_factory: RewardCalculatorFactory = ZeroRewardCalculator,
         visual_feature_provider: Optional[VisualFeatureProvider] = None,
@@ -239,6 +240,7 @@ class NavGPTEnvironmentFactory:
             raise ValueError("success_distance must be positive")
         self.navigation_input_mode = navigation_input_mode
         self.max_steps = max_steps
+        self.seed = int(seed)
         self.success_distance = success_distance
         self.reward_calculator_factory = reward_calculator_factory
         self.visual_feature_provider = visual_feature_provider
@@ -297,7 +299,7 @@ class NavGPTEnvironmentFactory:
             self.connectivity_dir,
             self.navigable_dir,
             batch_size=1,
-            seed=0,
+            seed=self.seed,
             name=f"R2R_RL_{instr_id}",
             graph_cache=self.graph_cache,
             verbose=False,
@@ -675,6 +677,115 @@ def trl_environment_reward(
     return rewards
 
 
+def finalize_native_transcript(
+    environment: NavGPTTRLEnvironment,
+    completion: Any,
+) -> RolloutSummary:
+    """Audit evaluator transcripts without exposing a second TRL tool.
+
+    TRL registers every public bound environment method except ``reset`` as a
+    model tool.  Keep this shared evaluator adapter at module scope so the
+    environment's sole public tool remains ``submit_navigation_decision``.
+    """
+
+    finalize = getattr(environment, "_finalize_for_trl", None)
+    if not callable(finalize):
+        raise TypeError("Native environment does not expose transcript finalization")
+    return finalize(completion)
+
+
+@dataclass(frozen=True)
+class NavigationToolResponseAudit:
+    """Strict audit of one assistant native-tool response.
+
+    Both GRPO transcript validation and the formal R2R evaluator consume this
+    result.  Keeping the envelope rules here prevents evaluation from
+    executing a response that training would mark as protocol-invalid.
+    """
+
+    policy_outputs: Tuple[str, ...]
+    navigation_call_count: int
+    violations: Tuple[str, ...]
+
+
+def audit_navigation_tool_response(
+    message: Any,
+) -> NavigationToolResponseAudit:
+    """Validate one assistant turn that is expected to call navigation once."""
+
+    if not isinstance(message, Mapping):
+        return NavigationToolResponseAudit(
+            policy_outputs=(),
+            navigation_call_count=0,
+            violations=("invalid_completion_message",),
+        )
+
+    violations: List[str] = []
+    if message.get("role") != "assistant":
+        violations.append("invalid_completion_role")
+
+    content = message.get("content")
+    if content is not None and (
+        not isinstance(content, str) or bool(content.strip())
+    ):
+        violations.append("assistant_content_with_tool_call")
+    reasoning_content = message.get("reasoning_content")
+    if reasoning_content is not None and (
+        not isinstance(reasoning_content, str)
+        or bool(reasoning_content.strip())
+    ):
+        violations.append("assistant_reasoning_content_with_tool_call")
+
+    raw_calls = message.get("tool_calls")
+    if not isinstance(raw_calls, Sequence) or isinstance(raw_calls, str):
+        return NavigationToolResponseAudit(
+            policy_outputs=(),
+            navigation_call_count=0,
+            violations=tuple(
+                dict.fromkeys(violations + ["invalid_tool_call_envelope"])
+            ),
+        )
+
+    policy_outputs: List[str] = []
+    navigation_calls = 0
+    for call in raw_calls:
+        if not isinstance(call, Mapping):
+            violations.append("invalid_tool_call_record")
+            continue
+        if call.get("type") != "function":
+            violations.append("invalid_tool_call_record")
+        function = call.get("function", {})
+        if not isinstance(function, Mapping):
+            violations.append("invalid_tool_function_record")
+            continue
+        if function.get("name") != "submit_navigation_decision":
+            violations.append("unexpected_tool_call")
+            continue
+        navigation_calls += 1
+        arguments = function.get("arguments")
+        if not isinstance(arguments, Mapping):
+            violations.append("invalid_navigation_tool_arguments")
+            continue
+        if set(arguments) != {"policy_output"}:
+            violations.append("unexpected_navigation_tool_arguments")
+        policy_output = arguments.get("policy_output")
+        if not isinstance(policy_output, str) or not policy_output.strip():
+            violations.append("invalid_navigation_tool_arguments")
+            continue
+        policy_outputs.append(policy_output)
+
+    if navigation_calls > 1:
+        violations.append("multiple_navigation_calls_in_one_turn")
+    elif navigation_calls == 0:
+        violations.append("missing_navigation_call_in_tool_turn")
+
+    return NavigationToolResponseAudit(
+        policy_outputs=tuple(policy_outputs),
+        navigation_call_count=navigation_calls,
+        violations=tuple(dict.fromkeys(violations)),
+    )
+
+
 def _tool_transcript_violations(
     completion: Any,
     *,
@@ -744,44 +855,10 @@ def _tool_transcript_violations(
             final_single_navigation_call = False
             continue
 
-        content = message.get("content")
-        if content is not None and (
-            not isinstance(content, str) or bool(content.strip())
-        ):
-            violations.append("assistant_content_with_tool_call")
-        reasoning_content = message.get("reasoning_content")
-        if reasoning_content is not None and (
-            not isinstance(reasoning_content, str)
-            or bool(reasoning_content.strip())
-        ):
-            violations.append("assistant_reasoning_content_with_tool_call")
-
-        navigation_calls = 0
-        for call in raw_calls:
-            if not isinstance(call, Mapping):
-                violations.append("invalid_tool_call_record")
-                continue
-            if call.get("type") != "function":
-                violations.append("invalid_tool_call_record")
-            function = call.get("function", {})
-            if not isinstance(function, Mapping):
-                violations.append("invalid_tool_function_record")
-                continue
-            if function.get("name") == "submit_navigation_decision":
-                navigation_calls += 1
-                native_tool_calls += 1
-                arguments = function.get("arguments")
-                if (
-                    not isinstance(arguments, Mapping)
-                    or not isinstance(arguments.get("policy_output"), str)
-                ):
-                    violations.append("invalid_navigation_tool_arguments")
-            else:
-                violations.append("unexpected_tool_call")
-        if navigation_calls > 1:
-            violations.append("multiple_navigation_calls_in_one_turn")
-        elif navigation_calls == 0:
-            violations.append("missing_navigation_call_in_tool_turn")
+        response_audit = audit_navigation_tool_response(message)
+        violations.extend(response_audit.violations)
+        navigation_calls = response_audit.navigation_call_count
+        native_tool_calls += navigation_calls
         outstanding_navigation_calls += navigation_calls
         final_single_navigation_call = (
             navigation_calls == 1

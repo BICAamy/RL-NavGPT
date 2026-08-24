@@ -10,6 +10,11 @@ from parser import parse_args
 from env import R2RNavBatch
 from agent import NavAgent
 from dotenv import load_dotenv
+from legacy_evaluation import (
+    LEGACY_EVALUATOR_MANIFEST,
+    ensure_legacy_evaluator_manifest,
+)
+
 
 def build_dataset(args):
 
@@ -112,6 +117,15 @@ def main():
             "--navigation_input_mode action_plan requires "
             "--action_plan_cache /path/to/merged.jsonl"
         )
+
+    manifest = ensure_legacy_evaluator_manifest(args)
+    print(
+        'WARNING: NavGPT.py uses the legacy LangChain evaluator; '
+        'official_rl_comparable=false; manifest='
+        + os.path.join(args.output_dir, LEGACY_EVALUATOR_MANIFEST)
+        + '; identity_sha256='
+        + manifest['identity_sha256']
+    )
 
     val_envs = build_dataset(args)
 

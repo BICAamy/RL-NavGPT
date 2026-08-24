@@ -393,7 +393,7 @@ def load_base_policy_model_and_tokenizer(
 
     try:
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoModelForCausalLM
     except ImportError as exc:
         raise LoRAPolicyError(
             "Loading the policy requires torch and transformers from "
@@ -445,6 +445,33 @@ def load_base_policy_model_and_tokenizer(
     else:
         resolved_device_map = {"": "cpu"}
 
+    tokenizer = load_policy_tokenizer(config)
+    model = AutoModelForCausalLM.from_pretrained(
+        str(model_path),
+        dtype=dtype,
+        device_map=resolved_device_map,
+        trust_remote_code=config.trust_remote_code,
+        local_files_only=config.local_files_only,
+        low_cpu_mem_usage=True,
+        use_safetensors=True,
+    )
+    validate_model_architecture(model, config)
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
+    return model, tokenizer
+
+
+def load_policy_tokenizer(config: LoRAPolicyConfig) -> Any:
+    """Load and normalize the exact local tokenizer without model weights."""
+
+    model_path = validate_local_model_directory(config.model_path)
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:
+        raise LoRAPolicyError(
+            "Loading the policy tokenizer requires transformers from "
+            "requirements-train.txt"
+        ) from exc
     tokenizer = AutoTokenizer.from_pretrained(
         str(model_path),
         trust_remote_code=config.trust_remote_code,
@@ -461,20 +488,7 @@ def load_base_policy_model_and_tokenizer(
             )
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        str(model_path),
-        dtype=dtype,
-        device_map=resolved_device_map,
-        trust_remote_code=config.trust_remote_code,
-        local_files_only=config.local_files_only,
-        low_cpu_mem_usage=True,
-        use_safetensors=True,
-    )
-    validate_model_architecture(model, config)
-    if hasattr(model.config, "use_cache"):
-        model.config.use_cache = False
-    return model, tokenizer
+    return tokenizer
 
 
 def validate_model_architecture(model: Any, config: LoRAPolicyConfig) -> None:

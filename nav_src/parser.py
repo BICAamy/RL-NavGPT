@@ -27,8 +27,20 @@ def parse_args(argv=None):
         type=str,
         default='',
         help=(
-            'optional local NavGPT LoRA adapter directory for the HF backend; '
-            'the adapter provenance manifest must match --local_model_path'
+            'legacy-only local NavGPT LoRA adapter directory for the HF '
+            'backend; official Base/LoRA evaluation must use '
+            'nav_src/scripts/evaluate_r2r_native.py'
+        ),
+    )
+    parser.add_argument(
+        '--allow_legacy_adapter_evaluation',
+        action='store_true',
+        default=False,
+        help=(
+            'DANGEROUS legacy opt-in: allow --local_adapter_path in the old '
+            'LangChain NavGPT.py evaluator. Its results are marked as not '
+            'official-RL-comparable. Use nav_src/scripts/evaluate_r2r_native.py for '
+            'formal Base/LoRA evaluation.'
         ),
     )
     parser.add_argument(
@@ -168,6 +180,14 @@ def parse_args(argv=None):
 
 def postprocess_args(args):
     if args.local_adapter_path:
+        if not args.allow_legacy_adapter_evaluation:
+            raise ValueError(
+                '--local_adapter_path is disabled in legacy NavGPT.py by '
+                'default. Formal Base/LoRA evaluation must use '
+                'nav_src/scripts/evaluate_r2r_native.py. For an explicitly '
+                'non-comparable historical reproduction only, add '
+                '--allow_legacy_adapter_evaluation.'
+            )
         if args.llm_backend != 'hf':
             raise ValueError(
                 '--local_adapter_path is valid only with --llm_backend hf'
