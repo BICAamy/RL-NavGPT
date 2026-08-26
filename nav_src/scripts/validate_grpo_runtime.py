@@ -38,7 +38,13 @@ from lora_policy import (  # noqa: E402
     LoRAPolicyConfig,
     fingerprint_local_model_weights,
 )
+from navigation_rewards import (  # noqa: E402
+    CompositeRewardConfig,
+    DISTANCE_POTENTIAL_PROGRESS_SHAPING,
+    NavigationRewardConfig,
+)
 from rl_env import NavGPTTRLEnvironment  # noqa: E402
+from scripts.train_grpo import build_reward_config  # noqa: E402
 
 
 def require(condition: bool, message: str) -> None:
@@ -857,6 +863,13 @@ def validate_run_manifest_model_binding(root: Path) -> None:
         clip_text_device="cpu",
         clip_text_dtype="fp32",
     )
+    cli_reward_config = build_reward_config(
+        SimpleNamespace(navigation_progress_scale=3.25)
+    )
+    require(
+        cli_reward_config.navigation.progress_scale == 3.25,
+        "Training CLI did not propagate the navigation progress scale",
+    )
     components = SimpleNamespace(
         config=component_config,
         task_records=({"instr_id": "fixture-task"},),
@@ -882,6 +895,40 @@ def validate_run_manifest_model_binding(root: Path) -> None:
         first["sources"]["policy_model_weights"]
         == fingerprint_local_model_weights(str(policy_model)),
         "Run manifest omitted the exact policy weight fingerprint",
+    )
+    recorded_navigation_reward = first["environment"]["component_config"][
+        "reward_config"
+    ]["navigation"]
+    require(
+        recorded_navigation_reward["progress_shaping"]
+        == DISTANCE_POTENTIAL_PROGRESS_SHAPING,
+        "Run manifest omitted the navigation progress algorithm identity",
+    )
+    require(
+        recorded_navigation_reward["progress_scale"] == 5.0,
+        "Run manifest omitted the navigation progress scale",
+    )
+
+    changed_reward_components = SimpleNamespace(
+        config=GRPOComponentConfig(
+            **{
+                **component_config.__dict__,
+                "reward_config": CompositeRewardConfig(
+                    navigation=NavigationRewardConfig(progress_scale=4.0),
+                ),
+            }
+        ),
+        task_records=components.task_records,
+    )
+    changed_reward = build_grpo_run_manifest(
+        policy_config=policy_config,
+        components=changed_reward_components,
+        optimization=optimization,
+        runtime_contract=runtime_contract,
+    )
+    require(
+        first["run_fingerprint"] != changed_reward["run_fingerprint"],
+        "Progress scale changes did not alter the run fingerprint",
     )
 
     cloned_output = root / "manifest-output-clone"

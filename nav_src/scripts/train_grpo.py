@@ -36,6 +36,10 @@ from grpo_training import (  # noqa: E402
     load_policy_and_build_grpo_trainer,
 )
 from lora_policy import LoRAPolicyConfig  # noqa: E402
+from navigation_rewards import (  # noqa: E402
+    CompositeRewardConfig,
+    NavigationRewardConfig,
+)
 from grpo_validation import (  # noqa: E402
     GRPOValidationConfig,
     GRPOValidationManager,
@@ -99,6 +103,7 @@ def _run(args: argparse.Namespace, distributed: DistributedContext) -> None:
         clip_text_device=args.clip_text_device,
         clip_text_dtype=args.clip_text_dtype,
         max_navigation_steps=args.max_navigation_steps,
+        reward_config=build_reward_config(args),
     )
     optimization = GRPOOptimizationConfig(
         output_dir=args.output_dir,
@@ -340,6 +345,16 @@ def resolve_parallel_batch_settings(
     return resolved_steps, resolved_accumulation
 
 
+def build_reward_config(args: argparse.Namespace) -> CompositeRewardConfig:
+    """Build the immutable reward identity for a training process."""
+
+    return CompositeRewardConfig(
+        navigation=NavigationRewardConfig(
+            progress_scale=args.navigation_progress_scale,
+        )
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     repo_root = NAV_SRC_DIR.parent
     parser = argparse.ArgumentParser(
@@ -444,6 +459,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="fp16",
     )
     parser.add_argument("--max-navigation-steps", type=int, default=10)
+    parser.add_argument(
+        "--navigation-progress-scale",
+        type=float,
+        default=5.0,
+        help=(
+            "scale for the distance-potential progress reward: each moved "
+            "transition receives scale * (previous_distance - "
+            "current_distance); recorded in the immutable run manifest"
+        ),
+    )
 
     parser.add_argument("--r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)

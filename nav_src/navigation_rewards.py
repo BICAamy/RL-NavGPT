@@ -36,12 +36,15 @@ class TextFeatureEncoder(Protocol):
 FactConsistencyScorer = Callable[[str, Sequence[str]], float]
 
 
+DISTANCE_POTENTIAL_PROGRESS_SHAPING = "distance_potential_v1"
+
+
 @dataclass(frozen=True)
 class NavigationRewardConfig:
     enabled: bool = True
     weight: float = 1.0
-    progress_reward: float = 5.0
-    progress_epsilon: float = 1e-6
+    progress_shaping: str = DISTANCE_POTENTIAL_PROGRESS_SHAPING
+    progress_scale: float = 5.0
     revisit_penalty: float = -10.0
     invalid_streak_length: int = 3
     invalid_streak_penalty: float = -20.0
@@ -55,7 +58,12 @@ class NavigationRewardConfig:
 
     def __post_init__(self) -> None:
         _require_nonnegative("navigation weight", self.weight)
-        _require_nonnegative("progress_epsilon", self.progress_epsilon)
+        if self.progress_shaping != DISTANCE_POTENTIAL_PROGRESS_SHAPING:
+            raise ValueError(
+                "progress_shaping must be "
+                f"{DISTANCE_POTENTIAL_PROGRESS_SHAPING!r}"
+            )
+        _require_nonnegative("progress_scale", self.progress_scale)
         if (
             isinstance(self.invalid_streak_length, bool)
             or not isinstance(self.invalid_streak_length, int)
@@ -76,7 +84,6 @@ class NavigationRewardConfig:
             raise ValueError(
                 "failure_shaping_temperature must be finite and positive"
             )
-        _require_nonnegative("progress_reward", self.progress_reward)
         _require_nonnegative(
             "subgoal_completion_reward",
             self.subgoal_completion_reward,
@@ -356,12 +363,30 @@ class CompositeRewardCalculator:
     ) -> None:
         config = self.config.navigation
         distance_delta = transition.previous_distance - transition.current_distance
-        diagnostics["navigation/distance_delta"] = distance_delta
-
-        if transition.moved and distance_delta > config.progress_epsilon:
-            components["navigation/progress"] = (
-                config.weight * config.progress_reward
-            )
+        previous_potential = (
+            -config.progress_scale * transition.previous_distance
+        )
+        current_potential = (
+            -config.progress_scale * transition.current_distance
+        )
+        unweighted_progress = (
+            current_potential - previous_potential
+            if transition.moved
+            else 0.0
+        )
+        components["navigation/progress"] = (
+            config.weight * unweighted_progress
+        )
+        diagnostics.update(
+            {
+                "navigation/progress_shaping": config.progress_shaping,
+                "navigation/progress_applied": transition.moved,
+                "navigation/distance_delta": distance_delta,
+                "navigation/previous_distance_potential": previous_potential,
+                "navigation/current_distance_potential": current_potential,
+                "navigation/progress_unweighted_reward": unweighted_progress,
+            }
+        )
         if transition.revisited:
             components["navigation/revisit"] = (
                 config.weight * config.revisit_penalty

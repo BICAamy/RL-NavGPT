@@ -33,6 +33,7 @@ from scripts.build_clip_cache import (  # noqa: E402
 )
 from navigation_rewards import (  # noqa: E402
     COMPONENT_NAMES,
+    DISTANCE_POTENTIAL_PROGRESS_SHAPING,
     CompositeRewardCalculator,
     CompositeRewardConfig,
     CompositeRewardFactory,
@@ -218,7 +219,19 @@ def validate_navigation_reward() -> None:
         }
     )
     result = calculator(transition(reward_metadata=metadata))
-    require(result.components["navigation/progress"] == 5.0, "Wrong progress reward")
+    require(
+        result.components["navigation/progress"] == 10.0,
+        "Distance-potential progress has the wrong magnitude",
+    )
+    require(
+        result.diagnostics["navigation/progress_shaping"]
+        == DISTANCE_POTENTIAL_PROGRESS_SHAPING,
+        "Progress diagnostics omitted the shaping identity",
+    )
+    require(
+        result.diagnostics["navigation/progress_applied"] is True,
+        "Moved transition was not marked as progress-bearing",
+    )
     require(
         result.components["navigation/subgoal_completion"] == 30.0,
         "Wrong one-shot subgoal reward",
@@ -238,7 +251,75 @@ def validate_navigation_reward() -> None:
             reward_metadata=metadata,
         )
     )
+    require(
+        revisit.components["navigation/progress"] == -5.0,
+        "Moving away from the goal did not receive symmetric negative progress",
+    )
     require(revisit.components["navigation/revisit"] == -10.0, "Wrong revisit penalty")
+
+    potential = CompositeRewardCalculator(
+        config=CompositeRewardConfig(
+            navigation=NavigationRewardConfig(
+                enabled=True,
+                weight=0.5,
+                progress_scale=4.0,
+            ),
+            semantic=SemanticRewardConfig(enabled=False),
+            thought=ThoughtRewardConfig(enabled=False),
+        )
+    )
+    distances = (10.0, 7.5, 9.0, 4.0)
+    progress_values = []
+    for previous_distance, current_distance in zip(
+        distances,
+        distances[1:],
+    ):
+        progress_values.append(
+            potential(
+                transition(
+                    previous_distance=previous_distance,
+                    current_distance=current_distance,
+                )
+            ).components["navigation/progress"]
+        )
+    require(
+        math.isclose(sum(progress_values), 0.5 * 4.0 * (10.0 - 4.0)),
+        "Distance-potential progress did not telescope to endpoint distance",
+    )
+    require(
+        progress_values[1] < 0.0,
+        "A detour away from the goal retained positive progress reward",
+    )
+    small_progress = potential(
+        transition(previous_distance=10.0, current_distance=9.99)
+    ).components["navigation/progress"]
+    large_progress = potential(
+        transition(previous_distance=10.0, current_distance=7.0)
+    ).components["navigation/progress"]
+    require(
+        math.isclose(small_progress, 0.02, abs_tol=1e-12),
+        "A 0.01m improvement did not receive its proportional reward",
+    )
+    require(
+        math.isclose(large_progress, 6.0),
+        "A 3m improvement did not receive its proportional reward",
+    )
+    stationary = potential(
+        transition(
+            previous_distance=10.0,
+            current_distance=8.0,
+            moved=False,
+            moved_path=(),
+        )
+    )
+    require(
+        stationary.components["navigation/progress"] == 0.0,
+        "A non-moving transition received progress reward",
+    )
+    require(
+        stationary.diagnostics["navigation/progress_applied"] is False,
+        "A non-moving transition was marked as progress-bearing",
+    )
 
     calculator.reset()
     invalid = transition(
@@ -500,13 +581,13 @@ def validate_composition_and_factory() -> None:
     )
     require(tuple(result.components) == COMPONENT_NAMES,
             "Reward component schema is unstable")
-    require(math.isclose(sum(result.components.values()), 49.0),
+    require(math.isclose(sum(result.components.values()), 54.0),
             "Composite reward sum is wrong")
 
     environment = object.__new__(NavGPTGymEnv)
     environment.reward_calculator = first
     components, diagnostics = environment._calculate_reward(transition())
-    require(math.isclose(sum(components.values()), 14.0),
+    require(math.isclose(sum(components.values()), 19.0),
             "Environment summed diagnostic values into reward")
     require("semantic/current_similarity" in diagnostics,
             "Environment dropped reward diagnostics")
@@ -525,7 +606,9 @@ def validate_composition_and_factory() -> None:
         raise AssertionError("Semantic reward accepted a missing feature provider")
 
     for invalid_constructor in (
-        lambda: NavigationRewardConfig(progress_epsilon=float("nan")),
+        lambda: NavigationRewardConfig(progress_scale=float("nan")),
+        lambda: NavigationRewardConfig(progress_scale=-1.0),
+        lambda: NavigationRewardConfig(progress_shaping="binary_positive"),
         lambda: NavigationRewardConfig(invalid_streak_length=True),
         lambda: SemanticRewardConfig(potential_scale=float("inf")),
     ):

@@ -53,7 +53,17 @@ r_t^{\mathrm{nav}}
 =r_t^{\mathrm{prog}}+r_t^{\mathrm{rev}}+r_t^{\mathrm{inv}}+r_t^{\mathrm{term}}.
 \]
 
-Let \(d_t\) be the shortest-path distance to the target. A valid move with \(d_t<d_{t-1}\) receives \(r_t^{\mathrm{prog}}=+5\); entering an already visited viewpoint gives \(r_t^{\mathrm{rev}}=-10\); and each non-moving attempt after the consecutive invalid count reaches three gives \(r_t^{\mathrm{inv}}=-20\). The other components are zero when their conditions are not met. Correct active stopping gives \(r_t^{\mathrm{term}}=+200\). The return of an unsuccessful episode is defined separately below so that such trajectories remain distinguishable without receiving an excessive score.
+Let \(d_t\) be the shortest-path distance to the target. We define the navigation potential and progress reward as
+
+\[
+\Phi_{\mathrm{nav}}(s_t)=-5d_t,
+\qquad
+r_t^{\mathrm{prog}}
+=\Phi_{\mathrm{nav}}(s_t)-\Phi_{\mathrm{nav}}(s_{t-1})
+=5(d_{t-1}-d_t).
+\]
+
+The progress term is applied only to executed movements: approaching the goal receives a positive reward proportional to the distance reduction, while moving away receives a symmetric negative reward. It is not clipped or thresholded, so its episode sum telescopes to \(5(d_0-d_T)\) and is aligned with the final endpoint rather than the minimum distance visited. Entering an already visited viewpoint additionally gives \(r_t^{\mathrm{rev}}=-10\), and each non-moving attempt after the consecutive invalid count reaches three gives \(r_t^{\mathrm{inv}}=-20\). The other components are zero when their conditions are not met. Correct active stopping gives \(r_t^{\mathrm{term}}=+200\). The return of an unsuccessful episode is defined separately below so that such trajectories remain distinguishable without receiving an excessive score.
 
 ### Raw-visual semantic reward
 
