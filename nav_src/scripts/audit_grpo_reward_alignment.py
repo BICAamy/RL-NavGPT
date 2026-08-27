@@ -306,15 +306,7 @@ def _component_statistics(
             float(dict(row.get("component_totals", {})).get(name, 0.0))
             for row in rows
         ]
-        result[name] = {
-            "mean": _mean(values),
-            "std": _population_std(values),
-            "nonzero_rate": (
-                statistics.fmean(1.0 if value != 0.0 else 0.0 for value in values)
-                if values
-                else None
-            ),
-        }
+        result[name] = _distribution_statistics(values)
     return result
 
 
@@ -336,16 +328,87 @@ def _family_statistics(
     result: Dict[str, Dict[str, Any]] = {}
     for family in ("navigation", "semantic", "thought"):
         values = [_family_value(row, family) for row in rows]
-        result[family] = {
-            "mean": _mean(values),
-            "std": _population_std(values),
-            "nonzero_rate": (
-                statistics.fmean(1.0 if value != 0.0 else 0.0 for value in values)
-                if values
-                else None
-            ),
-        }
+        result[family] = _distribution_statistics(values)
     return result
+
+
+def _distribution_statistics(values: Sequence[float]) -> Dict[str, Any]:
+    """Expose reward sign and range, not only how often a component fires."""
+
+    if not values:
+        return {
+            "mean": None,
+            "std": None,
+            "minimum": None,
+            "maximum": None,
+            "nonzero_rate": None,
+            "positive_rate": None,
+            "negative_rate": None,
+        }
+    return {
+        "mean": _mean(values),
+        "std": _population_std(values),
+        "minimum": min(values),
+        "maximum": max(values),
+        "nonzero_rate": statistics.fmean(
+            1.0 if value != 0.0 else 0.0 for value in values
+        ),
+        "positive_rate": statistics.fmean(
+            1.0 if value > 0.0 else 0.0 for value in values
+        ),
+        "negative_rate": statistics.fmean(
+            1.0 if value < 0.0 else 0.0 for value in values
+        ),
+    }
+
+
+def _thought_diagnostic_statistics(
+    rows: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Summarize detailed Thought decisions when trajectory logging permits."""
+
+    status_counts: Counter[str] = Counter()
+    detailed_rollout_count = 0
+    detailed_step_count = 0
+    text_alignment_observation_count = 0
+    text_aligned_count = 0
+    subgoal_rewarded_count = 0
+    for row in rows:
+        steps = row.get("trajectory_steps", [])
+        if not isinstance(steps, list) or not steps:
+            continue
+        detailed_rollout_count += 1
+        for step in steps:
+            if not isinstance(step, Mapping):
+                continue
+            diagnostics = step.get("reward_diagnostics", {})
+            if not isinstance(diagnostics, Mapping):
+                continue
+            detailed_step_count += 1
+            status = diagnostics.get("thought/action_consistency_status")
+            if status is not None:
+                status_counts[str(status)] += 1
+            text_aligned = diagnostics.get("thought/subgoal_text_aligned")
+            if text_aligned is not None:
+                text_alignment_observation_count += 1
+                text_aligned_count += int(bool(text_aligned))
+            subgoal_rewarded_count += int(
+                diagnostics.get("thought/subgoal_rewarded") is True
+            )
+    return {
+        "detailed_rollout_count": detailed_rollout_count,
+        "detailed_step_count": detailed_step_count,
+        "action_consistency_status_counts": dict(sorted(status_counts.items())),
+        "subgoal_text_alignment_observation_count": (
+            text_alignment_observation_count
+        ),
+        "subgoal_text_aligned_rate": (
+            text_aligned_count / text_alignment_observation_count
+            if text_alignment_observation_count
+            else None
+        ),
+        "subgoal_rewarded_count": subgoal_rewarded_count,
+    }
 
 
 def _family_alignment(
@@ -476,12 +539,16 @@ def build_audit_report(run_dir: Path) -> Dict[str, Any]:
     if not isinstance(optimization, Mapping):
         raise RewardAlignmentAuditError("Run manifest omitted optimization")
     num_generations = int(optimization.get("num_generations", 0))
-    navigation_config = (
+    reward_config = (
         manifest.get("environment", {})
         .get("component_config", {})
         .get("reward_config", {})
-        .get("navigation", {})
     )
+    if not isinstance(reward_config, Mapping):
+        raise RewardAlignmentAuditError(
+            "Run manifest omitted reward configuration"
+        )
+    navigation_config = reward_config.get("navigation", {})
     if not isinstance(navigation_config, Mapping):
         raise RewardAlignmentAuditError(
             "Run manifest omitted navigation reward configuration"
@@ -502,6 +569,11 @@ def build_audit_report(run_dir: Path) -> Dict[str, Any]:
     ):
         raise RewardAlignmentAuditError(
             "Run manifest has invalid progress scale/navigation weight"
+        )
+    thought_config = reward_config.get("thought", {})
+    if not isinstance(thought_config, Mapping):
+        raise RewardAlignmentAuditError(
+            "Run manifest has an invalid thought reward configuration"
         )
 
     canonical_rows, stale_count = canonicalize_rollouts(rollouts, sessions)
@@ -562,6 +634,14 @@ def build_audit_report(run_dir: Path) -> Dict[str, Any]:
             "progress_scale": progress_scale,
             "navigation_weight": navigation_weight,
             "weighted_progress_scale": progress_scale * navigation_weight,
+            "thought_protocol": thought_config.get("protocol"),
+            "thought_weight": thought_config.get("weight"),
+            "thought_subgoal_alignment_mode": thought_config.get(
+                "subgoal_alignment_mode"
+            ),
+            "thought_subgoal_alignment_reward": thought_config.get(
+                "subgoal_alignment_reward"
+            ),
         },
         "canonicalization": {
             "raw_rollout_count": len(rollouts),
@@ -607,6 +687,7 @@ def build_audit_report(run_dir: Path) -> Dict[str, Any]:
         },
         "reward_families": _family_statistics(complete_rows),
         "reward_components": _component_statistics(complete_rows),
+        "thought_diagnostics": _thought_diagnostic_statistics(complete_rows),
         "success_failure_preference": _success_failure_preference(groups),
         "clean_all_fail_alignment": {
             "final_distance": final_alignment,

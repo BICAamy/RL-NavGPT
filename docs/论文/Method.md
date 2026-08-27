@@ -79,33 +79,35 @@ Because cosine similarity is bounded, \(r_t^{\mathrm{sem}}\in[-8,8]\). Its cumul
 
 ### Thought-quality reward
 
-Thought quality comprises sequential subgoal alignment, thought--action agreement, and factual consistency. For plan lines \(p_1,\ldots,p_M\), thought \(c_t\), and next unrewarded plan index \(k_t\), we compute
+Thought quality is implemented as the versioned conservative auxiliary protocol `grounded_auxiliary_v1`, with \(\lambda_{\mathrm{th}}=0.25\). It retains text--plan alignment as a diagnostic, but does not turn it into reward because the production data do not provide a versioned mapping from each textual plan line to a physically reached viewpoint. For plan lines \(p_1,\ldots,p_M\) and thought \(c_t\), we log
 
 \[
 j_t^*=\arg\max_j\cos(E_T(c_t),E_T(p_j)),
-\quad
-r_t^{\mathrm{sub}}=5\,\mathbf{1}
-\left[j_t^*=k_t\ \land\ \cos(E_T(c_t),E_T(p_{j_t^*}))\geq0.25\right].
+\qquad
+q_t^{\mathrm{sub}}=\mathbf{1}
+\left[\cos(E_T(c_t),E_T(p_{j_t^*}))\geq0.25\right],
+\qquad
+r_t^{\mathrm{sub}}=0.
 \]
 
-The index advances only after a match, so each subgoal is rewarded once and in order. Thought--action agreement is defined by
+Thus, plausible plan paraphrasing cannot be rewarded without physical progress. Thought--action agreement is defined by the nominal score
 
 \[
-r_t^{\mathrm{act}}=
+\widetilde r_t^{\mathrm{act}}=
 \begin{cases}
-+5, & c_t\text{ explicitly supports }a_t,\\
++5, & c_t\text{ exactly supports an executed, grounded }a_t,\\
 -8, & c_t\text{ contradicts }a_t\text{ or the decision is invalid},\\
 0, & \text{otherwise}.
 \end{cases}
 \]
 
-Support or contradiction is determined from explicit move/stop intent, the mentioned viewpoint, and its relative direction. For factual consistency, let \(e_t=(o_t,\mathcal{O}_t,\tau_{<t})\) collect the current panorama, visible-object set \(\mathcal{O}_t\), and recent history. Let \(U(c_t,e_t)\) indicate an explicit present-tense visual claim in \(c_t\) that is absent from this evidence. For a valid decision,
+Positive support requires an environment-confirmed successful Finish, or an actually executed move/backtrack whose unique direction or viewpoint identifier exactly matches the thought. Generic phrases such as “move”, “proceed”, or “continue”, an ambiguous set of directions, an unexecuted action, and an unconfirmed Finish claim receive zero. Explicitly conflicting actions, directions, or viewpoint identifiers retain the negative score. For factual consistency, let \(e_t=(o_t,\mathcal{O}_t,\tau_{<t})\) collect the available observation text, visible-object set \(\mathcal{O}_t\), and recent history. Let \(U(c_t,e_t)\) indicate an explicit present-tense visual claim in \(c_t\) that is absent from this evidence. For a valid decision, the nominal score is
 
 \[
-r_t^{\mathrm{fact}}=-8\,\mathbf{1}[U(c_t,e_t)].
+\widetilde r_t^{\mathrm{fact}}=-8\,\mathbf{1}[U(c_t,e_t)].
 \]
 
-We log the CLIP similarity between the thought and evidence for analysis but do not reward or penalize it: different wording can express the same valid reasoning. Parse errors and invalid actions receive the action-consistency penalty and are ineligible for positive subgoal reward.
+The reward contribution is \(\lambda_{\mathrm{th}}(r_t^{\mathrm{sub}}+\widetilde r_t^{\mathrm{act}}+\widetilde r_t^{\mathrm{fact}})\), so a grounded positive contributes \(+1.25\) and a contradiction contributes \(-2\). We log CLIP similarities for analysis but do not use low similarity alone as a contradiction: different wording can express the same valid reasoning. Parse errors and invalid actions receive the scaled action-consistency penalty. The protocol name, weight, diagnostic-only subgoal mode, and component magnitudes are part of the immutable run identity.
 
 ### Episode return
 

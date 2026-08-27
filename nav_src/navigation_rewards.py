@@ -37,6 +37,8 @@ FactConsistencyScorer = Callable[[str, Sequence[str]], float]
 
 
 DISTANCE_POTENTIAL_PROGRESS_SHAPING = "distance_potential_v1"
+GROUNDED_AUXILIARY_THOUGHT_REWARD = "grounded_auxiliary_v1"
+DIAGNOSTIC_ONLY_SUBGOAL_ALIGNMENT = "diagnostic_only_v1"
 
 
 @dataclass(frozen=True)
@@ -112,15 +114,27 @@ class SemanticRewardConfig:
 @dataclass(frozen=True)
 class ThoughtRewardConfig:
     enabled: bool = True
-    weight: float = 1.0
+    protocol: str = GROUNDED_AUXILIARY_THOUGHT_REWARD
+    weight: float = 0.25
+    subgoal_alignment_mode: str = DIAGNOSTIC_ONLY_SUBGOAL_ALIGNMENT
     subgoal_alignment_threshold: float = 0.25
-    subgoal_alignment_reward: float = 5.0
+    subgoal_alignment_reward: float = 0.0
     action_consistency_reward: float = 5.0
     contradiction_penalty: float = -8.0
     fact_consistency_threshold: float = 0.20
 
     def __post_init__(self) -> None:
+        if self.protocol != GROUNDED_AUXILIARY_THOUGHT_REWARD:
+            raise ValueError(
+                "thought protocol must be "
+                f"{GROUNDED_AUXILIARY_THOUGHT_REWARD!r}"
+            )
         _require_nonnegative("thought weight", self.weight)
+        if self.subgoal_alignment_mode != DIAGNOSTIC_ONLY_SUBGOAL_ALIGNMENT:
+            raise ValueError(
+                "subgoal_alignment_mode must be "
+                f"{DIAGNOSTIC_ONLY_SUBGOAL_ALIGNMENT!r}"
+            )
         _require_similarity_threshold(
             "subgoal_alignment_threshold",
             self.subgoal_alignment_threshold,
@@ -133,6 +147,10 @@ class ThoughtRewardConfig:
             "subgoal_alignment_reward",
             self.subgoal_alignment_reward,
         )
+        if self.subgoal_alignment_reward != 0.0:
+            raise ValueError(
+                "diagnostic-only subgoal alignment cannot carry reward"
+            )
         _require_nonnegative(
             "action_consistency_reward",
             self.action_consistency_reward,
@@ -234,7 +252,6 @@ class CompositeRewardCalculator:
         self._completed_subgoals: Set[str] = set()
         self._landmark_penalty_applied = False
         self._episode_component_sum = 0.0
-        self._next_thought_subgoal_index = 0
         if initial_observation is not None:
             metadata = _reward_metadata(initial_observation)
             start = str(initial_observation.get("viewpoint", ""))
@@ -500,6 +517,15 @@ class CompositeRewardCalculator:
         diagnostics: Dict[str, Any],
     ) -> None:
         config = self.config.thought
+        diagnostics.update(
+            {
+                "thought/reward_protocol": config.protocol,
+                "thought/reward_weight": config.weight,
+                "thought/subgoal_alignment_mode": (
+                    config.subgoal_alignment_mode
+                ),
+            }
+        )
         output = transition.parsed_output
         if output is None:
             components["thought/action_consistency"] = (
@@ -508,8 +534,16 @@ class CompositeRewardCalculator:
             diagnostics.update(
                 {
                     "thought/subgoal_similarity": None,
+                    "thought/subgoal_text_aligned": None,
+                    "thought/subgoal_rewarded": False,
+                    "thought/subgoal_reward_blocked_reason": "parse_error",
                     "thought/action_consistency_status": "parse_error",
+                    "thought/action_consistency_unweighted_score": (
+                        config.contradiction_penalty
+                    ),
+                    "thought/action_consistency_rewarded": False,
                     "thought/fact_consistency_score": None,
+                    "thought/fact_consistency_unweighted_score": 0.0,
                     "thought/fact_consistency_method": "not_scored",
                     "thought/unsupported_visual_claim": None,
                     "thought/fact_consistency_status": "not_scored",
@@ -524,9 +558,17 @@ class CompositeRewardCalculator:
             diagnostics.update(
                 {
                     "thought/subgoal_similarity": None,
+                    "thought/subgoal_text_aligned": None,
+                    "thought/subgoal_rewarded": False,
+                    "thought/subgoal_reward_blocked_reason": "invalid_action",
                     "thought/action_consistency_status": "invalid_action",
+                    "thought/action_consistency_unweighted_score": (
+                        config.contradiction_penalty
+                    ),
+                    "thought/action_consistency_rewarded": False,
                     "thought/target_direction": None,
                     "thought/fact_consistency_score": None,
+                    "thought/fact_consistency_unweighted_score": 0.0,
                     "thought/fact_consistency_method": "not_scored",
                     "thought/unsupported_visual_claim": None,
                     "thought/fact_consistency_status": "not_scored",
@@ -557,20 +599,16 @@ class CompositeRewardCalculator:
         ]
         matched_subgoal_index = int(np.argmax(subgoal_similarities))
         subgoal_similarity = subgoal_similarities[matched_subgoal_index]
-        expected_subgoal_index = self._next_thought_subgoal_index
-        subgoal_rewarded = (
+        subgoal_text_aligned = (
             subgoal_similarity >= config.subgoal_alignment_threshold
-            and matched_subgoal_index == expected_subgoal_index
         )
-        if subgoal_rewarded:
-            components["thought/subgoal_alignment"] = (
-                config.weight * config.subgoal_alignment_reward
-            )
-            self._next_thought_subgoal_index += 1
         diagnostics["thought/subgoal_similarity"] = subgoal_similarity
         diagnostics["thought/matched_subgoal_index"] = matched_subgoal_index
-        diagnostics["thought/expected_subgoal_index"] = expected_subgoal_index
-        diagnostics["thought/subgoal_rewarded"] = subgoal_rewarded
+        diagnostics["thought/subgoal_text_aligned"] = subgoal_text_aligned
+        diagnostics["thought/subgoal_rewarded"] = False
+        diagnostics["thought/subgoal_reward_blocked_reason"] = (
+            "no_versioned_physical_subgoal_grounding"
+        )
         diagnostics["thought/subgoal_threshold"] = (
             config.subgoal_alignment_threshold
         )
@@ -581,6 +619,8 @@ class CompositeRewardCalculator:
         )
         components["thought/action_consistency"] = config.weight * action_score
         diagnostics["thought/action_consistency_status"] = action_status
+        diagnostics["thought/action_consistency_unweighted_score"] = action_score
+        diagnostics["thought/action_consistency_rewarded"] = action_score > 0.0
         diagnostics["thought/target_direction"] = target_direction
 
         evidence = _fact_evidence(transition)
@@ -619,6 +659,9 @@ class CompositeRewardCalculator:
             components["thought/fact_consistency"] = (
                 config.weight * config.contradiction_penalty
             )
+        diagnostics["thought/fact_consistency_unweighted_score"] = (
+            0.0 if fact_consistent else config.contradiction_penalty
+        )
         diagnostics["thought/fact_consistency_score"] = fact_score
         diagnostics["thought/fact_consistency_method"] = fact_method
         diagnostics["thought/unsupported_visual_claim"] = unsupported_claim
@@ -826,7 +869,7 @@ def _action_consistency(
     thought = output.thought.lower()
     mentioned_ids = set(_VIEWPOINT_PATTERN.findall(thought))
     selected_id = output.viewpoint_id
-    if mentioned_ids and selected_id not in mentioned_ids:
+    if selected_id is not None and mentioned_ids and selected_id not in mentioned_ids:
         return config.contradiction_penalty, "different_viewpoint_mentioned", None
 
     finish_cue = _has_unnegated_cue(
@@ -873,17 +916,28 @@ def _action_consistency(
     )
 
     if output.action_name == FINISH_ACTION:
-        if finish_cue:
-            return config.action_consistency_reward, "finish_supported", None
         if backtrack_cue or move_cue:
             return config.contradiction_penalty, "finish_contradicted", None
+        if finish_cue and transition.success:
+            return config.action_consistency_reward, "successful_finish_supported", None
+        if finish_cue:
+            return 0.0, "finish_claim_not_environment_confirmed", None
         return 0.0, "finish_not_explicitly_supported", None
 
     if output.action_name == BACK_TRACE_NAME:
         if finish_cue or (move_cue and not backtrack_cue):
             return config.contradiction_penalty, "backtrack_contradicted", None
-        if backtrack_cue or (selected_id is not None and selected_id in mentioned_ids):
-            return config.action_consistency_reward, "backtrack_supported", None
+        exact_selected_id = (
+            selected_id is not None and mentioned_ids == {selected_id}
+        )
+        if backtrack_cue or exact_selected_id:
+            if transition.moved:
+                return (
+                    config.action_consistency_reward,
+                    "executed_backtrack_supported",
+                    None,
+                )
+            return 0.0, "backtrack_not_executed", None
         return 0.0, "backtrack_not_explicitly_supported", None
 
     if output.action_name != MAKE_ACTION_NAME:
@@ -893,20 +947,35 @@ def _action_consistency(
 
     target_direction = _target_direction(transition)
     mentioned_directions = _mentioned_directions(thought)
-    if mentioned_directions and target_direction is not None:
+    if mentioned_directions:
+        if target_direction is None:
+            return 0.0, "direction_not_groundable", None
         if target_direction not in mentioned_directions:
             return (
                 config.contradiction_penalty,
                 "direction_contradiction",
                 target_direction,
             )
+        if len(mentioned_directions) != 1:
+            return 0.0, "ambiguous_direction_language", target_direction
+        if not transition.moved:
+            return 0.0, "direction_matched_but_not_executed", target_direction
         return (
             config.action_consistency_reward,
-            "direction_supported",
+            "executed_direction_supported",
             target_direction,
         )
-    if move_cue or (selected_id is not None and selected_id in mentioned_ids):
-        return config.action_consistency_reward, "move_supported", target_direction
+    exact_selected_id = selected_id is not None and mentioned_ids == {selected_id}
+    if exact_selected_id:
+        if transition.moved:
+            return (
+                config.action_consistency_reward,
+                "executed_viewpoint_supported",
+                target_direction,
+            )
+        return 0.0, "viewpoint_matched_but_not_executed", target_direction
+    if move_cue:
+        return 0.0, "generic_move_language_only", target_direction
     return 0.0, "move_not_explicitly_supported", target_direction
 
 

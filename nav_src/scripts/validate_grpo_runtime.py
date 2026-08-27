@@ -40,8 +40,11 @@ from lora_policy import (  # noqa: E402
 )
 from navigation_rewards import (  # noqa: E402
     CompositeRewardConfig,
+    DIAGNOSTIC_ONLY_SUBGOAL_ALIGNMENT,
     DISTANCE_POTENTIAL_PROGRESS_SHAPING,
+    GROUNDED_AUXILIARY_THOUGHT_REWARD,
     NavigationRewardConfig,
+    ThoughtRewardConfig,
 )
 from rl_env import NavGPTTRLEnvironment  # noqa: E402
 from scripts.train_grpo import build_reward_config  # noqa: E402
@@ -864,11 +867,18 @@ def validate_run_manifest_model_binding(root: Path) -> None:
         clip_text_dtype="fp32",
     )
     cli_reward_config = build_reward_config(
-        SimpleNamespace(navigation_progress_scale=3.25)
+        SimpleNamespace(
+            navigation_progress_scale=3.25,
+            thought_reward_weight=0.125,
+        )
     )
     require(
         cli_reward_config.navigation.progress_scale == 3.25,
         "Training CLI did not propagate the navigation progress scale",
+    )
+    require(
+        cli_reward_config.thought.weight == 0.125,
+        "Training CLI did not propagate the thought reward weight",
     )
     components = SimpleNamespace(
         config=component_config,
@@ -908,6 +918,24 @@ def validate_run_manifest_model_binding(root: Path) -> None:
         recorded_navigation_reward["progress_scale"] == 5.0,
         "Run manifest omitted the navigation progress scale",
     )
+    recorded_thought_reward = first["environment"]["component_config"][
+        "reward_config"
+    ]["thought"]
+    require(
+        recorded_thought_reward["protocol"]
+        == GROUNDED_AUXILIARY_THOUGHT_REWARD,
+        "Run manifest omitted the thought reward protocol identity",
+    )
+    require(
+        recorded_thought_reward["subgoal_alignment_mode"]
+        == DIAGNOSTIC_ONLY_SUBGOAL_ALIGNMENT,
+        "Run manifest omitted the diagnostic-only subgoal mode",
+    )
+    require(
+        recorded_thought_reward["weight"] == 0.25
+        and recorded_thought_reward["subgoal_alignment_reward"] == 0.0,
+        "Run manifest recorded the wrong conservative thought magnitude",
+    )
 
     changed_reward_components = SimpleNamespace(
         config=GRPOComponentConfig(
@@ -929,6 +957,28 @@ def validate_run_manifest_model_binding(root: Path) -> None:
     require(
         first["run_fingerprint"] != changed_reward["run_fingerprint"],
         "Progress scale changes did not alter the run fingerprint",
+    )
+
+    changed_thought_components = SimpleNamespace(
+        config=GRPOComponentConfig(
+            **{
+                **component_config.__dict__,
+                "reward_config": CompositeRewardConfig(
+                    thought=ThoughtRewardConfig(weight=0.125),
+                ),
+            }
+        ),
+        task_records=components.task_records,
+    )
+    changed_thought = build_grpo_run_manifest(
+        policy_config=policy_config,
+        components=changed_thought_components,
+        optimization=optimization,
+        runtime_contract=runtime_contract,
+    )
+    require(
+        first["run_fingerprint"] != changed_thought["run_fingerprint"],
+        "Thought reward changes did not alter the run fingerprint",
     )
 
     cloned_output = root / "manifest-output-clone"

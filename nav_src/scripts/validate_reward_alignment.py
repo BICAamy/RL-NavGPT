@@ -70,6 +70,13 @@ def _rollout(
                 "current_distance": final_distance,
                 "moved_path": [f"end-{local_index}"],
                 "reward_components": {"navigation/progress": progress},
+                "reward_diagnostics": {
+                    "thought/action_consistency_status": (
+                        "generic_move_language_only"
+                    ),
+                    "thought/subgoal_text_aligned": True,
+                    "thought/subgoal_rewarded": False,
+                },
             }
         ],
     }
@@ -175,7 +182,13 @@ def validate_full_report() -> None:
                             "progress_shaping": "distance_potential_v1",
                             "progress_scale": 5.0,
                             "weight": 1.0,
-                        }
+                        },
+                        "thought": {
+                            "protocol": "grounded_auxiliary_v1",
+                            "weight": 0.25,
+                            "subgoal_alignment_mode": "diagnostic_only_v1",
+                            "subgoal_alignment_reward": 0.0,
+                        },
                     }
                 }
             },
@@ -216,8 +229,34 @@ def validate_full_report() -> None:
             "Full audit rejected exact potential telescoping",
         )
         require(
+            report["reward_protocol"]["thought_protocol"]
+            == "grounded_auxiliary_v1"
+            and report["reward_protocol"]["thought_weight"] == 0.25
+            and report["reward_protocol"]["thought_subgoal_alignment_reward"]
+            == 0.0,
+            "Full audit omitted the Thought reward identity",
+        )
+        require(
             report["reward_families"]["navigation"]["mean"] == 17.5,
             "Reward-family statistics are wrong",
+        )
+        require(
+            report["reward_families"]["navigation"]["positive_rate"] == 1.0
+            and report["reward_families"]["navigation"]["negative_rate"] == 0.0,
+            "Reward-family sign rates are wrong",
+        )
+        require(
+            report["reward_components"]["navigation/progress"]["minimum"] == 10.0
+            and report["reward_components"]["navigation/progress"]["maximum"]
+            == 25.0,
+            "Reward-component range is wrong",
+        )
+        require(
+            report["thought_diagnostics"]["detailed_step_count"] == 20
+            and report["thought_diagnostics"]["action_consistency_status_counts"]
+            == {"generic_move_language_only": 20}
+            and report["thought_diagnostics"]["subgoal_rewarded_count"] == 0,
+            "Thought diagnostic aggregation is wrong",
         )
         require(
             report["clean_all_fail_family_alignment"]["navigation"]

@@ -33,7 +33,9 @@ from scripts.build_clip_cache import (  # noqa: E402
 )
 from navigation_rewards import (  # noqa: E402
     COMPONENT_NAMES,
+    DIAGNOSTIC_ONLY_SUBGOAL_ALIGNMENT,
     DISTANCE_POTENTIAL_PROGRESS_SHAPING,
+    GROUNDED_AUXILIARY_THOUGHT_REWARD,
     CompositeRewardCalculator,
     CompositeRewardConfig,
     CompositeRewardFactory,
@@ -427,20 +429,50 @@ def validate_thought_reward() -> None:
         fact_consistency_scorer=fact_scorer,
     )
     aligned = calculator(transition())
-    require(aligned.components["thought/subgoal_alignment"] == 5.0,
-            "Wrong thought/subgoal reward")
-    require(aligned.components["thought/action_consistency"] == 5.0,
-            "Correct thought/action pair was not rewarded")
+    require(aligned.components["thought/subgoal_alignment"] == 0.0,
+            "Diagnostic-only text subgoal alignment changed reward")
+    require(
+        aligned.diagnostics["thought/subgoal_text_aligned"] is True,
+        "Aligned plan text was not retained as a diagnostic",
+    )
+    require(
+        aligned.diagnostics["thought/subgoal_reward_blocked_reason"]
+        == "no_versioned_physical_subgoal_grounding",
+        "Text-only subgoal alignment did not report why reward was blocked",
+    )
+    require(
+        aligned.diagnostics["thought/reward_protocol"]
+        == GROUNDED_AUXILIARY_THOUGHT_REWARD,
+        "Thought diagnostics omitted the reward protocol identity",
+    )
+    require(
+        aligned.diagnostics["thought/subgoal_alignment_mode"]
+        == DIAGNOSTIC_ONLY_SUBGOAL_ALIGNMENT,
+        "Thought diagnostics omitted the subgoal mode",
+    )
+    require(aligned.components["thought/action_consistency"] == 1.25,
+            "Executed direction match received the wrong auxiliary reward")
     require(aligned.components["thought/fact_consistency"] == 0.0,
             "Grounded thought was penalized")
     repeated = calculator(transition())
     require(repeated.components["thought/subgoal_alignment"] == 0.0,
-            "Repeated plan text received the same subgoal reward twice")
+            "Text-only plan alignment unexpectedly carried reward")
+
+    generic = calculator(
+        transition(parsed_output=move_output("Proceed now."))
+    )
+    require(generic.components["thought/action_consistency"] == 0.0,
+            "Generic movement language received positive reward")
+    require(
+        generic.diagnostics["thought/action_consistency_status"]
+        == "generic_move_language_only",
+        "Generic movement diagnostic is wrong",
+    )
 
     contradicted = calculator(
         transition(parsed_output=move_output("Turn left into the hallway."))
     )
-    require(contradicted.components["thought/action_consistency"] == -8.0,
+    require(contradicted.components["thought/action_consistency"] == -2.0,
             "Direction contradiction was not penalized")
     require(
         contradicted.diagnostics["thought/action_consistency_status"]
@@ -455,7 +487,7 @@ def validate_thought_reward() -> None:
             )
         )
     )
-    require(hallucinated.components["thought/fact_consistency"] == -8.0,
+    require(hallucinated.components["thought/fact_consistency"] == -2.0,
             "Ungrounded thought was not penalized")
     require(
         hallucinated.diagnostics["thought/fact_consistency_status"]
@@ -474,7 +506,7 @@ def validate_thought_reward() -> None:
             )
         )
     )
-    require(unsupported.components["thought/fact_consistency"] == -8.0,
+    require(unsupported.components["thought/fact_consistency"] == -2.0,
             "Unsupported explicit visual claim was not penalized")
     require(
         unsupported.diagnostics["thought/unsupported_visual_claim"] == "stairs",
@@ -493,7 +525,7 @@ def validate_thought_reward() -> None:
     )
 
     invalid = calculator(parse_error_transition())
-    require(invalid.components["thought/action_consistency"] == -8.0,
+    require(invalid.components["thought/action_consistency"] == -2.0,
             "Unparseable decision was not penalized")
 
     parsed_invalid = calculator(
@@ -501,8 +533,49 @@ def validate_thought_reward() -> None:
     )
     require(parsed_invalid.components["thought/subgoal_alignment"] == 0.0,
             "Invalid movement received subgoal-alignment reward")
-    require(parsed_invalid.components["thought/action_consistency"] == -8.0,
+    require(parsed_invalid.components["thought/action_consistency"] == -2.0,
             "Invalid movement was not contradicted")
+
+    successful_finish = calculator(
+        transition(
+            parsed_output=finish_output(),
+            moved=False,
+            moved_path=(),
+            terminated=True,
+            success=True,
+            termination_reason="goal_reached",
+        )
+    )
+    require(
+        successful_finish.components["thought/action_consistency"] == 1.25,
+        "Environment-confirmed finish did not receive auxiliary credit",
+    )
+    premature_finish = calculator(
+        transition(
+            parsed_output=finish_output(),
+            moved=False,
+            moved_path=(),
+            terminated=True,
+            success=False,
+            termination_reason="premature_finish",
+        )
+    )
+    require(
+        premature_finish.components["thought/action_consistency"] == 0.0,
+        "Unsuccessful finish claim received positive thought reward",
+    )
+
+    viewpoint_grounded = calculator(
+        transition(
+            parsed_output=move_output(
+                f"Select the observed viewpoint {TARGET_ID}."
+            )
+        )
+    )
+    require(
+        viewpoint_grounded.components["thought/action_consistency"] == 1.25,
+        "Executed exact-viewpoint match did not receive auxiliary credit",
+    )
 
 
 def validate_failed_episode_return() -> None:
@@ -581,13 +654,13 @@ def validate_composition_and_factory() -> None:
     )
     require(tuple(result.components) == COMPONENT_NAMES,
             "Reward component schema is unstable")
-    require(math.isclose(sum(result.components.values()), 54.0),
+    require(math.isclose(sum(result.components.values()), 45.25),
             "Composite reward sum is wrong")
 
     environment = object.__new__(NavGPTGymEnv)
     environment.reward_calculator = first
     components, diagnostics = environment._calculate_reward(transition())
-    require(math.isclose(sum(components.values()), 19.0),
+    require(math.isclose(sum(components.values()), 15.25),
             "Environment summed diagnostic values into reward")
     require("semantic/current_similarity" in diagnostics,
             "Environment dropped reward diagnostics")
@@ -611,6 +684,10 @@ def validate_composition_and_factory() -> None:
         lambda: NavigationRewardConfig(progress_shaping="binary_positive"),
         lambda: NavigationRewardConfig(invalid_streak_length=True),
         lambda: SemanticRewardConfig(potential_scale=float("inf")),
+        lambda: ThoughtRewardConfig(protocol="legacy"),
+        lambda: ThoughtRewardConfig(subgoal_alignment_mode="sequential"),
+        lambda: ThoughtRewardConfig(subgoal_alignment_reward=5.0),
+        lambda: ThoughtRewardConfig(weight=-0.1),
     ):
         try:
             invalid_constructor()
@@ -805,7 +882,7 @@ def main() -> None:
     print("PASS stage-four composite rewards")
     print("- navigation progress/revisit/invalid/subgoal/landmark/terminal rewards")
     print("- cycle-safe raw-visual CLIP potential shaping")
-    print("- thought subgoal/action/fact consistency rewards")
+    print("- grounded auxiliary thought action/fact reward and subgoal diagnostics")
     print("- per-rollout state isolation and diagnostic/reward separation")
     print("- schema-v2 cache provenance, BGR conversion, and LRU safety")
 

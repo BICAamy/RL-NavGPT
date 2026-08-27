@@ -39,6 +39,7 @@ from lora_policy import LoRAPolicyConfig  # noqa: E402
 from navigation_rewards import (  # noqa: E402
     CompositeRewardConfig,
     NavigationRewardConfig,
+    ThoughtRewardConfig,
 )
 from grpo_validation import (  # noqa: E402
     GRPOValidationConfig,
@@ -351,7 +352,8 @@ def build_reward_config(args: argparse.Namespace) -> CompositeRewardConfig:
     return CompositeRewardConfig(
         navigation=NavigationRewardConfig(
             progress_scale=args.navigation_progress_scale,
-        )
+        ),
+        thought=ThoughtRewardConfig(weight=args.thought_reward_weight),
     )
 
 
@@ -467,6 +469,17 @@ def build_parser() -> argparse.ArgumentParser:
             "scale for the distance-potential progress reward: each moved "
             "transition receives scale * (previous_distance - "
             "current_distance); recorded in the immutable run manifest"
+        ),
+    )
+    parser.add_argument(
+        "--thought-reward-weight",
+        type=float,
+        default=0.25,
+        help=(
+            "weight for the grounded-auxiliary thought reward; positive "
+            "action credit requires executed, physically checkable evidence, "
+            "and text-only subgoal alignment is diagnostic-only; recorded in "
+            "the immutable run manifest"
         ),
     )
 
