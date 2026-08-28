@@ -222,14 +222,30 @@ class FakeToolLoopEnvironment:
     def __init__(self) -> None:
         self.calls: list[str] = []
         self._done = False
+        self.terminal_suffix_compactions: list[tuple[int, int]] = []
 
     @property
     def episode_done(self) -> bool:
         return self._done
 
     @property
-    def last_info(self) -> dict[str, bool]:
-        return {"terminated": self._done, "truncated": False}
+    def last_info(self) -> dict[str, Any]:
+        return {
+            "terminated": self._done,
+            "truncated": False,
+            "termination_reason": "fixture_terminal" if self._done else None,
+        }
+
+    def _record_terminal_tool_suffix_compaction(
+        self,
+        *,
+        original_tokens: int,
+        compact_tokens: int,
+    ) -> None:
+        require(self._done, "Compaction was recorded before terminal state")
+        self.terminal_suffix_compactions.append(
+            (int(original_tokens), int(compact_tokens))
+        )
 
     def submit_navigation_decision(self, policy_output: str) -> str:
         self.calls.append(str(policy_output))
@@ -274,6 +290,37 @@ class FakeToolLoopProcessingClass:
             "\n" if int(token_id) == 32 else "token"
             for token_id in token_ids
         )
+
+
+class VariableTerminalSuffixProcessingClass(FakeToolLoopProcessingClass):
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        add_generation_prompt,
+        chat_template,
+        return_dict,
+        **kwargs,
+    ):
+        del chat_template, return_dict, kwargs
+        ids = []
+        for message in messages:
+            role = message["role"]
+            if role == "user":
+                ids.append(10)
+            elif role == "assistant":
+                ids.append(20)
+            elif role == "tool":
+                content = str(message.get("content", ""))
+                if content.startswith("Navigation episode ended:"):
+                    ids.extend([30] * 19 + [self.eos_token_id, 32])
+                else:
+                    ids.extend([30] * 59 + [self.eos_token_id, 32])
+            else:
+                raise AssertionError(f"Unexpected fake chat role: {role}")
+        if add_generation_prompt:
+            ids.append(40)
+        return ids
 
 
 def assistant_tool_call(*policy_outputs: str) -> dict[str, Any]:
@@ -620,6 +667,51 @@ def validate_terminal_suffix_budget_guard(root: Path) -> None:
         "An exactly fitting terminal suffix generated another assistant turn",
     )
 
+    compacted = FakeToolLoopEnvironment()
+    trainer, generation_calls, _ = make_tool_loop_trainer(
+        root / "terminal-suffix-compacted",
+        [compacted],
+        [],
+        max_iterations=1,
+    )
+    trainer.processing_class = VariableTerminalSuffixProcessingClass()
+    trainer.eos_token_id = trainer.processing_class.eos_token_id
+    trainer.max_completion_length = 8192
+    trainer.model.config.max_position_embeddings = 20_000
+    completion = [101] * 8134
+    result = trainer._tool_call_loop(
+        [[{"role": "user", "content": "terminal-suffix-compacted"}]],
+        [[1]],
+        [completion],
+        [[assistant_tool_call("terminal-budget-boundary")]],
+        [[0.1] * len(completion)],
+        None,
+        {},
+    )
+    require(
+        len(result[2][0]) == 8154
+        and result[2][0][:8134] == completion
+        and result[2][0][-1] == trainer.eos_token_id,
+        "The production 8134+60 overflow did not compact through EOS",
+    )
+    require(
+        result[0][0] == [1] * 8134 + [0] * 20,
+        "Compact terminal suffix changed the assistant/tool mask boundary",
+    )
+    require(
+        result[1][0][-1]["content"]
+        == "Navigation episode ended: fixture_terminal.",
+        "Terminal tool result did not record the compact reason",
+    )
+    require(
+        compacted.terminal_suffix_compactions == [(60, 20)],
+        "Terminal suffix token savings were not recorded exactly",
+    )
+    require(
+        not generation_calls,
+        "A compact terminal suffix generated another assistant turn",
+    )
+
     context_overflow = FakeToolLoopEnvironment()
     trainer, generation_calls, _ = make_tool_loop_trainer(
         root / "terminal-suffix-model-context-overflow",
@@ -710,6 +802,10 @@ def validate_logging(root: Path) -> None:
         "The P0 post-terminal violation metric did not emit an explicit zero",
     )
     require(
+        metrics["nav/terminal_tool_suffix_compaction_rate"] == 0.0,
+        "Ordinary terminal suffixes were incorrectly marked as compacted",
+    )
+    require(
         metrics["nav/environment_termination/goal_reached"] == 0.5
         and metrics["nav/environment_termination/max_steps"] == 0.5,
         "Raw environment termination reasons were not logged",
@@ -726,6 +822,15 @@ def validate_logging(root: Path) -> None:
         for line in recorder.rollout_log_path.read_text(encoding="utf-8").splitlines()
     ]
     require(len(rollout_rows) == 2, "Wrong rollout log cardinality")
+    require(
+        all(
+            row["terminal_tool_suffix_compacted"] is False
+            and row["terminal_tool_suffix_original_tokens"] == 0
+            and row["terminal_tool_suffix_compact_tokens"] == 0
+            for row in rollout_rows
+        ),
+        "Clean rollout logs recorded a nonexistent terminal compaction",
+    )
     serialized = canonical_json(rollout_rows)
     require("policy_prompt" not in serialized, "Full prompt leaked into rollout log")
     require(
@@ -1317,7 +1422,8 @@ def main() -> None:
     print("PASS stage-six logging and resume contract")
     print("- canonical reward unchanged; navigation metrics and compact traces logged")
     print("- terminal-aware TRL tool loop preserves mixed-batch IDs and masks")
-    print("- terminal suffix budget boundaries fail closed before EOS truncation")
+    print("- terminal suffix overflow compacts only unconsumed terminal results")
+    print("- irreducible suffix budget boundaries fail closed before EOS loss")
     print("- run identity is bound to exact local Qwen Safetensors weights")
     print(
         "- LoRA/ref plus optimizer, scheduler, FP16 scaler, RNG, "

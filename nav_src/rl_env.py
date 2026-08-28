@@ -108,6 +108,9 @@ class RolloutSummary:
     minimum_distance_to_goal: float
     trajectory_path: Tuple[str, ...]
     protocol_violations: Tuple[str, ...]
+    terminal_tool_suffix_compacted: bool
+    terminal_tool_suffix_original_tokens: int
+    terminal_tool_suffix_compact_tokens: int
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -130,6 +133,15 @@ class RolloutSummary:
             "minimum_distance_to_goal": self.minimum_distance_to_goal,
             "trajectory_path": list(self.trajectory_path),
             "protocol_violations": list(self.protocol_violations),
+            "terminal_tool_suffix_compacted": (
+                self.terminal_tool_suffix_compacted
+            ),
+            "terminal_tool_suffix_original_tokens": (
+                self.terminal_tool_suffix_original_tokens
+            ),
+            "terminal_tool_suffix_compact_tokens": (
+                self.terminal_tool_suffix_compact_tokens
+            ),
         }
 
 
@@ -382,6 +394,9 @@ class NavGPTTRLEnvironment:
         self._attempted_tool_call_count = 0
         self._executed_tool_call_count = 0
         self._protocol_violations: List[str] = []
+        self._terminal_tool_suffix_compacted = False
+        self._terminal_tool_suffix_original_tokens = 0
+        self._terminal_tool_suffix_compact_tokens = 0
 
     @property
     def environment(self) -> Optional["NavGPTGymEnv"]:
@@ -468,7 +483,30 @@ class NavGPTTRLEnvironment:
         self._attempted_tool_call_count = 0
         self._executed_tool_call_count = 0
         self._protocol_violations = []
+        self._terminal_tool_suffix_compacted = False
+        self._terminal_tool_suffix_original_tokens = 0
+        self._terminal_tool_suffix_compact_tokens = 0
         return format_trl_navigation_observation(prompt)
+
+    def _record_terminal_tool_suffix_compaction(
+        self,
+        *,
+        original_tokens: int,
+        compact_tokens: int,
+    ) -> None:
+        """Record a zero-mask terminal transcript compaction for audit logs."""
+
+        if not self.episode_done:
+            raise RuntimeError(
+                "Terminal tool suffix can only be compacted after episode end"
+            )
+        if original_tokens <= compact_tokens or compact_tokens <= 0:
+            raise ValueError("Invalid terminal tool suffix compaction lengths")
+        if self._terminal_tool_suffix_compacted:
+            raise RuntimeError("Terminal tool suffix was compacted more than once")
+        self._terminal_tool_suffix_compacted = True
+        self._terminal_tool_suffix_original_tokens = int(original_tokens)
+        self._terminal_tool_suffix_compact_tokens = int(compact_tokens)
 
     def _get_accumulated_reward(self) -> float:
         """Private reward accessor; private methods are not TRL tools."""
@@ -595,6 +633,15 @@ class NavGPTTRLEnvironment:
                 str(value) for value in info.get("trajectory_path", ())
             ),
             protocol_violations=tuple(violations),
+            terminal_tool_suffix_compacted=(
+                self._terminal_tool_suffix_compacted
+            ),
+            terminal_tool_suffix_original_tokens=(
+                self._terminal_tool_suffix_original_tokens
+            ),
+            terminal_tool_suffix_compact_tokens=(
+                self._terminal_tool_suffix_compact_tokens
+            ),
         )
         # A completion-free read cannot certify the native transcript.  Keep it
         # provisional so a later standard TRL reward call can still fail closed

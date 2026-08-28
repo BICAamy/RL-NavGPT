@@ -35,6 +35,7 @@ ROLLOUT_LOG_NAME = "navigation_rollouts.jsonl"
 TRAIN_LOG_NAME = "train_metrics.jsonl"
 SESSION_LOG_NAME = "training_sessions.jsonl"
 IMPLEMENTATION_PATCH_LEDGER_NAME = "navgpt_grpo_implementation_patches.json"
+COMPACT_TERMINAL_TOOL_RESULT_PREFIX = "Navigation episode ended:"
 
 
 class GRPORuntimeError(RuntimeError):
@@ -266,6 +267,12 @@ class NavigationMetricsRecorder:
             "nav/truncated_rate": _rate(rows, "truncated"),
             "nav/protocol_violation_rate": statistics.fmean(
                 1.0 if row["protocol_violations"] else 0.0 for row in rows
+            ),
+            "nav/terminal_tool_suffix_compaction_rate": statistics.fmean(
+                1.0
+                if row.get("terminal_tool_suffix_compacted", False)
+                else 0.0
+                for row in rows
             ),
             "nav/mean_steps": _mean(rows, "step_count"),
             "nav/mean_attempted_tool_calls": statistics.fmean(
@@ -528,6 +535,51 @@ def _terminal_tool_suffix_ids(
     return suffix_ids
 
 
+def _compact_terminal_tool_suffix_ids(
+    trainer: Any,
+    *,
+    sample_index: int,
+    tool_messages: Sequence[Mapping[str, Any]],
+    original_tokens: int,
+) -> List[int]:
+    """Replace an unconsumed terminal observation with a compact tool result."""
+
+    if len(tool_messages) != 1:
+        raise GRPORuntimeError(
+            "Terminal suffix compaction requires exactly one tool result: "
+            f"sample_index={sample_index}, results={len(tool_messages)}"
+        )
+    environment = trainer.environments[sample_index]
+    info = getattr(environment, "last_info", None) or {}
+    reason = str(info.get("termination_reason") or "environment_terminal")
+    if re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", reason) is None:
+        reason = "environment_terminal"
+    original_message = tool_messages[0]
+    compact_message = dict(original_message)
+    compact_message["content"] = (
+        f"{COMPACT_TERMINAL_TOOL_RESULT_PREFIX} {reason}."
+    )
+    compact_ids = _terminal_tool_suffix_ids(trainer, [compact_message])
+    if len(compact_ids) >= original_tokens:
+        return compact_ids
+    if not isinstance(original_message, dict):
+        raise GRPORuntimeError(
+            "Terminal tool result is immutable and cannot be compacted"
+        )
+    original_message["content"] = compact_message["content"]
+    record = getattr(
+        environment,
+        "_record_terminal_tool_suffix_compaction",
+        None,
+    )
+    if callable(record):
+        record(
+            original_tokens=original_tokens,
+            compact_tokens=len(compact_ids),
+        )
+    return compact_ids
+
+
 def _parse_trl_tool_response(trainer: Any, token_ids: Sequence[int]) -> Dict[str, Any]:
     """Use TRL's pinned parser, with an injectable dependency-light test hook."""
 
@@ -685,6 +737,18 @@ def _environment_aware_tool_call_loop(
                 suffix_ids = _terminal_tool_suffix_ids(self, tool_messages)
             else:
                 suffix_ids = self._get_tool_suffix_ids(tool_messages)
+            original_terminal_suffix_tokens = len(suffix_ids)
+            if (
+                terminal_after_tools[local_index]
+                and len(completion_ids[idx_with_tool]) + len(suffix_ids)
+                > self.max_completion_length
+            ):
+                suffix_ids = _compact_terminal_tool_suffix_ids(
+                    self,
+                    sample_index=idx_with_tool,
+                    tool_messages=tool_messages,
+                    original_tokens=original_terminal_suffix_tokens,
+                )
             if (
                 terminal_after_tools[local_index]
                 and len(completion_ids[idx_with_tool]) + len(suffix_ids)
@@ -695,7 +759,9 @@ def _environment_aware_tool_call_loop(
                     f"sample_index={idx_with_tool}, "
                     "assistant_and_prior_tool_tokens="
                     f"{len(completion_ids[idx_with_tool])}, "
-                    f"terminal_suffix_tokens={len(suffix_ids)}, "
+                    "original_terminal_suffix_tokens="
+                    f"{original_terminal_suffix_tokens}, "
+                    f"compact_terminal_suffix_tokens={len(suffix_ids)}, "
                     f"limit={self.max_completion_length}. Configure a per-turn "
                     "generation limit that reserves terminal-suffix capacity."
                 )
