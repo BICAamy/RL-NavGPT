@@ -42,7 +42,7 @@ r_t=\lambda_{\mathrm{nav}}r_t^{\mathrm{nav}}
 r_t^{\mathrm{th}}=r_t^{\mathrm{sub}}+r_t^{\mathrm{act}}+r_t^{\mathrm{fact}}.
 \]
 
-All weights equal 1 in the full model and can be disabled independently for ablation.
+We use \(\lambda_{\mathrm{nav}}=\lambda_{\mathrm{sem}}=1\) and the conservative Thought auxiliary weight \(\lambda_{\mathrm{th}}=0.25\). Each family can be disabled independently for ablation.
 
 ### Navigation reward
 
@@ -67,15 +67,23 @@ The progress term is applied only to executed movements: approaching the goal re
 
 ### Raw-visual semantic reward
 
-To recover visual evidence omitted by captions, we construct a training-only signal from Matterport3D RGB views. With CLIP ViT-L/14 (Radford et al., 2021), we precompute a normalized instruction embedding \(u=E_T(x)\) and normalized image embeddings for 36 views at each viewpoint: 12 headings at three elevations. At runtime, \(z_t\) is the feature nearest to the current orientation. We use the potential difference
+To recover visual evidence omitted by captions, we construct a training-only signal from Matterport3D RGB views. With CLIP ViT-L/14 (Radford et al., 2021), we precompute a normalized instruction embedding \(u=E_T(x)\) and normalized image embeddings for 36 views at each viewpoint: 12 headings at three elevations. At runtime, \(z_t\) is the feature nearest to the current orientation. The versioned protocol `bounded_raw_visual_potential_v1` uses the potential difference
 
 \[
-\Phi(s_t)=4u^\top z_t,
+\Phi_{\mathrm{sem}}(s_t)=\kappa u^\top z_t,
 \qquad
-r_t^{\mathrm{sem}}=\Phi(s_t)-\Phi(s_{t-1}).
+r_t^{\mathrm{sem}}
+=\Phi_{\mathrm{sem}}(s_t)-\Phi_{\mathrm{sem}}(s_{t-1}).
 \]
 
-Because cosine similarity is bounded, \(r_t^{\mathrm{sem}}\in[-8,8]\). Its cumulative value is zero when a trajectory returns to the same discretized pose, preventing repeated semantic gain from cycling through the same states. This reward is computed exclusively from raw-image features, never from substituted caption embeddings.
+The current source scale is \(\kappa=4\); candidate scales are selected by counterfactually replaying canonical rollout groups before another training run. Because cosine similarity is bounded, both a single transition and the telescoped episode contribution lie in \([-2\kappa,2\kappa]\). The production configuration enforces
+
+\[
+2\lambda_{\mathrm{sem}}\kappa
+\leq 0.25\,\lambda_{\mathrm{nav}}r^{\mathrm{success}},
+\]
+
+so Semantic can never exceed 25% of the \(+200\) success terminal signal; with unit Semantic weight, \(\kappa\leq25\). Its cumulative value is zero when a trajectory returns to the same discretized pose, preventing repeated semantic gain from cycling through the same states. This reward is computed exclusively from raw-image features, never from substituted caption embeddings. Protocol, scale, weight, and safety fraction are recorded in the immutable run identity.
 
 ### Thought-quality reward
 

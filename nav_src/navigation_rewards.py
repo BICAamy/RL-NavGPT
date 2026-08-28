@@ -37,6 +37,7 @@ FactConsistencyScorer = Callable[[str, Sequence[str]], float]
 
 
 DISTANCE_POTENTIAL_PROGRESS_SHAPING = "distance_potential_v1"
+BOUNDED_RAW_VISUAL_SEMANTIC_REWARD = "bounded_raw_visual_potential_v1"
 GROUNDED_AUXILIARY_THOUGHT_REWARD = "grounded_auxiliary_v1"
 DIAGNOSTIC_ONLY_SUBGOAL_ALIGNMENT = "diagnostic_only_v1"
 
@@ -103,12 +104,28 @@ class NavigationRewardConfig:
 @dataclass(frozen=True)
 class SemanticRewardConfig:
     enabled: bool = True
+    protocol: str = BOUNDED_RAW_VISUAL_SEMANTIC_REWARD
     weight: float = 1.0
     potential_scale: float = 4.0
+    max_terminal_reward_fraction: float = 0.25
 
     def __post_init__(self) -> None:
+        if self.protocol != BOUNDED_RAW_VISUAL_SEMANTIC_REWARD:
+            raise ValueError(
+                "semantic protocol must be "
+                f"{BOUNDED_RAW_VISUAL_SEMANTIC_REWARD!r}"
+            )
         _require_nonnegative("semantic weight", self.weight)
         _require_nonnegative("semantic potential_scale", self.potential_scale)
+        if (
+            not math.isfinite(self.max_terminal_reward_fraction)
+            or self.max_terminal_reward_fraction <= 0.0
+            or self.max_terminal_reward_fraction > 1.0
+        ):
+            raise ValueError(
+                "semantic max_terminal_reward_fraction must be finite and in "
+                "(0, 1]"
+            )
 
 
 @dataclass(frozen=True)
@@ -167,6 +184,25 @@ class CompositeRewardConfig:
         default_factory=SemanticRewardConfig
     )
     thought: ThoughtRewardConfig = field(default_factory=ThoughtRewardConfig)
+
+    def __post_init__(self) -> None:
+        if not self.semantic.enabled or not self.navigation.enabled:
+            return
+        semantic_bound = (
+            2.0 * self.semantic.weight * self.semantic.potential_scale
+        )
+        terminal_reward = (
+            self.navigation.weight * self.navigation.success_reward
+        )
+        maximum_semantic_bound = (
+            self.semantic.max_terminal_reward_fraction * terminal_reward
+        )
+        if semantic_bound > maximum_semantic_bound + 1e-12:
+            raise ValueError(
+                "semantic episode bound exceeds its terminal-reward safety "
+                f"budget: bound={semantic_bound}, "
+                f"maximum={maximum_semantic_bound}"
+            )
 
 
 COMPONENT_NAMES = (
@@ -501,6 +537,15 @@ class CompositeRewardCalculator:
         )
         diagnostics.update(
             {
+                "semantic/reward_protocol": config.protocol,
+                "semantic/reward_weight": config.weight,
+                "semantic/potential_scale": config.potential_scale,
+                "semantic/theoretical_episode_absolute_bound": (
+                    2.0 * config.weight * config.potential_scale
+                ),
+                "semantic/max_terminal_reward_fraction": (
+                    config.max_terminal_reward_fraction
+                ),
                 "semantic/previous_similarity": previous_similarity,
                 "semantic/current_similarity": current_similarity,
                 "semantic/similarity_delta": similarity_delta,

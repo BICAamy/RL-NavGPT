@@ -575,6 +575,11 @@ def build_audit_report(run_dir: Path) -> Dict[str, Any]:
         raise RewardAlignmentAuditError(
             "Run manifest has an invalid thought reward configuration"
         )
+    semantic_config = reward_config.get("semantic", {})
+    if not isinstance(semantic_config, Mapping):
+        raise RewardAlignmentAuditError(
+            "Run manifest has an invalid semantic reward configuration"
+        )
 
     canonical_rows, stale_count = canonicalize_rollouts(rollouts, sessions)
     groups, incomplete_count = build_complete_groups(
@@ -634,6 +639,12 @@ def build_audit_report(run_dir: Path) -> Dict[str, Any]:
             "progress_scale": progress_scale,
             "navigation_weight": navigation_weight,
             "weighted_progress_scale": progress_scale * navigation_weight,
+            "semantic_protocol": semantic_config.get("protocol"),
+            "semantic_weight": semantic_config.get("weight"),
+            "semantic_potential_scale": semantic_config.get("potential_scale"),
+            "semantic_max_terminal_reward_fraction": semantic_config.get(
+                "max_terminal_reward_fraction"
+            ),
             "thought_protocol": thought_config.get("protocol"),
             "thought_weight": thought_config.get("weight"),
             "thought_subgoal_alignment_mode": thought_config.get(

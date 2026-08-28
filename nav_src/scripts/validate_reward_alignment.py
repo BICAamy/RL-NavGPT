@@ -183,6 +183,12 @@ def validate_full_report() -> None:
                             "progress_scale": 5.0,
                             "weight": 1.0,
                         },
+                        "semantic": {
+                            "protocol": "bounded_raw_visual_potential_v1",
+                            "weight": 1.0,
+                            "potential_scale": 4.0,
+                            "max_terminal_reward_fraction": 0.25,
+                        },
                         "thought": {
                             "protocol": "grounded_auxiliary_v1",
                             "weight": 0.25,
@@ -227,6 +233,16 @@ def validate_full_report() -> None:
         require(
             report["progress_telescoping"]["passed"] is True,
             "Full audit rejected exact potential telescoping",
+        )
+        require(
+            report["reward_protocol"]["semantic_protocol"]
+            == "bounded_raw_visual_potential_v1"
+            and report["reward_protocol"]["semantic_potential_scale"] == 4.0
+            and report["reward_protocol"][
+                "semantic_max_terminal_reward_fraction"
+            ]
+            == 0.25,
+            "Full audit omitted the Semantic reward identity",
         )
         require(
             report["reward_protocol"]["thought_protocol"]

@@ -39,11 +39,13 @@ from lora_policy import (  # noqa: E402
     fingerprint_local_model_weights,
 )
 from navigation_rewards import (  # noqa: E402
+    BOUNDED_RAW_VISUAL_SEMANTIC_REWARD,
     CompositeRewardConfig,
     DIAGNOSTIC_ONLY_SUBGOAL_ALIGNMENT,
     DISTANCE_POTENTIAL_PROGRESS_SHAPING,
     GROUNDED_AUXILIARY_THOUGHT_REWARD,
     NavigationRewardConfig,
+    SemanticRewardConfig,
     ThoughtRewardConfig,
 )
 from rl_env import NavGPTTRLEnvironment  # noqa: E402
@@ -869,12 +871,17 @@ def validate_run_manifest_model_binding(root: Path) -> None:
     cli_reward_config = build_reward_config(
         SimpleNamespace(
             navigation_progress_scale=3.25,
+            semantic_potential_scale=12.0,
             thought_reward_weight=0.125,
         )
     )
     require(
         cli_reward_config.navigation.progress_scale == 3.25,
         "Training CLI did not propagate the navigation progress scale",
+    )
+    require(
+        cli_reward_config.semantic.potential_scale == 12.0,
+        "Training CLI did not propagate the semantic potential scale",
     )
     require(
         cli_reward_config.thought.weight == 0.125,
@@ -918,6 +925,19 @@ def validate_run_manifest_model_binding(root: Path) -> None:
         recorded_navigation_reward["progress_scale"] == 5.0,
         "Run manifest omitted the navigation progress scale",
     )
+    recorded_semantic_reward = first["environment"]["component_config"][
+        "reward_config"
+    ]["semantic"]
+    require(
+        recorded_semantic_reward["protocol"]
+        == BOUNDED_RAW_VISUAL_SEMANTIC_REWARD,
+        "Run manifest omitted the semantic reward protocol identity",
+    )
+    require(
+        recorded_semantic_reward["potential_scale"] == 4.0
+        and recorded_semantic_reward["max_terminal_reward_fraction"] == 0.25,
+        "Run manifest recorded the wrong semantic scale safety contract",
+    )
     recorded_thought_reward = first["environment"]["component_config"][
         "reward_config"
     ]["thought"]
@@ -957,6 +977,28 @@ def validate_run_manifest_model_binding(root: Path) -> None:
     require(
         first["run_fingerprint"] != changed_reward["run_fingerprint"],
         "Progress scale changes did not alter the run fingerprint",
+    )
+
+    changed_semantic_components = SimpleNamespace(
+        config=GRPOComponentConfig(
+            **{
+                **component_config.__dict__,
+                "reward_config": CompositeRewardConfig(
+                    semantic=SemanticRewardConfig(potential_scale=12.0),
+                ),
+            }
+        ),
+        task_records=components.task_records,
+    )
+    changed_semantic = build_grpo_run_manifest(
+        policy_config=policy_config,
+        components=changed_semantic_components,
+        optimization=optimization,
+        runtime_contract=runtime_contract,
+    )
+    require(
+        first["run_fingerprint"] != changed_semantic["run_fingerprint"],
+        "Semantic scale changes did not alter the run fingerprint",
     )
 
     changed_thought_components = SimpleNamespace(

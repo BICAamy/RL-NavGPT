@@ -32,6 +32,7 @@ from scripts.build_clip_cache import (  # noqa: E402
     _resume_scan_record,
 )
 from navigation_rewards import (  # noqa: E402
+    BOUNDED_RAW_VISUAL_SEMANTIC_REWARD,
     COMPONENT_NAMES,
     DIAGNOSTIC_ONLY_SUBGOAL_ALIGNMENT,
     DISTANCE_POTENTIAL_PROGRESS_SHAPING,
@@ -391,6 +392,16 @@ def validate_semantic_reward() -> None:
     result = calculator(transition())
     require(result.components["semantic/alignment_delta"] == 4.0,
             "Semantic potential delta is wrong")
+    require(
+        result.diagnostics["semantic/reward_protocol"]
+        == BOUNDED_RAW_VISUAL_SEMANTIC_REWARD,
+        "Semantic diagnostics omitted the protocol identity",
+    )
+    require(
+        result.diagnostics["semantic/theoretical_episode_absolute_bound"]
+        == 8.0,
+        "Semantic diagnostics recorded the wrong theoretical bound",
+    )
     require(result.diagnostics["semantic/previous_similarity"] == 0.0,
             "Wrong previous CLIP similarity")
     require(result.diagnostics["semantic/current_similarity"] == 1.0,
@@ -420,6 +431,19 @@ def validate_semantic_reward() -> None:
         cycle_reward += step.components["semantic/alignment_delta"]
     require(math.isclose(cycle_reward, 0.0, abs_tol=1e-6),
             "Semantic shaping permits positive reward on a closed cycle")
+
+    bounded = CompositeRewardCalculator(
+        config=CompositeRewardConfig(
+            navigation=NavigationRewardConfig(enabled=False),
+            semantic=SemanticRewardConfig(potential_scale=24.0),
+            thought=ThoughtRewardConfig(enabled=False),
+        ),
+        instruction_feature_provider=FixedInstructionFeatures(),
+    )(transition())
+    require(
+        bounded.components["semantic/alignment_delta"] == 24.0,
+        "A safe counterfactual semantic scale was not applied exactly",
+    )
 
 
 def validate_thought_reward() -> None:
@@ -684,6 +708,11 @@ def validate_composition_and_factory() -> None:
         lambda: NavigationRewardConfig(progress_shaping="binary_positive"),
         lambda: NavigationRewardConfig(invalid_streak_length=True),
         lambda: SemanticRewardConfig(potential_scale=float("inf")),
+        lambda: SemanticRewardConfig(protocol="legacy"),
+        lambda: SemanticRewardConfig(max_terminal_reward_fraction=0.0),
+        lambda: CompositeRewardConfig(
+            semantic=SemanticRewardConfig(potential_scale=25.01),
+        ),
         lambda: ThoughtRewardConfig(protocol="legacy"),
         lambda: ThoughtRewardConfig(subgoal_alignment_mode="sequential"),
         lambda: ThoughtRewardConfig(subgoal_alignment_reward=5.0),

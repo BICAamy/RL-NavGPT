@@ -39,6 +39,7 @@ from lora_policy import LoRAPolicyConfig  # noqa: E402
 from navigation_rewards import (  # noqa: E402
     CompositeRewardConfig,
     NavigationRewardConfig,
+    SemanticRewardConfig,
     ThoughtRewardConfig,
 )
 from grpo_validation import (  # noqa: E402
@@ -353,6 +354,9 @@ def build_reward_config(args: argparse.Namespace) -> CompositeRewardConfig:
         navigation=NavigationRewardConfig(
             progress_scale=args.navigation_progress_scale,
         ),
+        semantic=SemanticRewardConfig(
+            potential_scale=args.semantic_potential_scale,
+        ),
         thought=ThoughtRewardConfig(weight=args.thought_reward_weight),
     )
 
@@ -469,6 +473,17 @@ def build_parser() -> argparse.ArgumentParser:
             "scale for the distance-potential progress reward: each moved "
             "transition receives scale * (previous_distance - "
             "current_distance); recorded in the immutable run manifest"
+        ),
+    )
+    parser.add_argument(
+        "--semantic-potential-scale",
+        type=float,
+        default=4.0,
+        help=(
+            "scale for the bounded raw-visual CLIP endpoint potential; the "
+            "composite reward rejects any value whose theoretical episode "
+            "bound exceeds 25 percent of the success terminal reward; "
+            "recorded in the immutable run manifest"
         ),
     )
     parser.add_argument(
