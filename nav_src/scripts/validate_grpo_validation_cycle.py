@@ -34,6 +34,10 @@ from grpo_runtime import (  # noqa: E402
     CHECKPOINT_MANIFEST_NAME,
     SESSION_LOG_NAME,
 )
+from grpo_validation import (  # noqa: E402
+    FULL_CANDIDATE_POLICY_ALL_FAST_SNAPSHOTS,
+    PERIODIC_FAST_SNAPSHOT_ROLE,
+)
 from r2r_evaluation import load_official_native_manifest  # noqa: E402
 
 
@@ -199,6 +203,10 @@ def _launch_command(
         str(args.fast_subset_size),
         "--validation-fast-interval-steps",
         "1",
+        "--validation-full-candidate-policy",
+        FULL_CANDIDATE_POLICY_ALL_FAST_SNAPSHOTS,
+        "--validation-expected-full-candidate-count",
+        "2",
         "--validation-max-new-tokens",
         str(args.validation_max_new_tokens),
         "--validation-progress-interval",
@@ -408,7 +416,17 @@ def _assert_final_state(
         "quick-best was not selected from a completed fast job",
     )
     full_jobs = [row for row in queue["jobs"] if row["mode"] == "full"]
-    require(full_jobs, "No full Val-Unseen fixture evaluation was completed")
+    require(
+        [int(row["step"]) for row in full_jobs] == [1, 2],
+        "Full validation did not cover both scheduled snapshots",
+    )
+    require(
+        all(
+            PERIODIC_FAST_SNAPSHOT_ROLE in candidate["roles"]
+            for candidate in full_events[0]["full_candidates"]
+        ),
+        "A scheduled full candidate lost its periodic snapshot role",
+    )
     require(
         all(int(row["result"]["count"]) == args.fixture_size for row in full_jobs),
         "A full evaluation has incomplete coverage",
@@ -608,6 +626,7 @@ def main() -> None:
     print("- training was interrupted with fast-step-1 persisted in the queue")
     print("- evaluation-only drained the queue without an optimizer step")
     print("- checkpoint-1 resumed through max step 2 and final full selection")
+    print("- both periodic snapshots completed full native validation")
     print(
         f"- final_full_event={report['final_full_event_id']} "
         f"roles={report['final_full_roles']}"

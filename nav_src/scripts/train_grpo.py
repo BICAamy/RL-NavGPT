@@ -44,9 +44,12 @@ from navigation_rewards import (  # noqa: E402
     ThoughtRewardConfig,
 )
 from grpo_validation import (  # noqa: E402
+    FULL_CANDIDATE_POLICIES,
+    FULL_CANDIDATE_POLICY_QUICK_BEST_AND_CURRENT,
     GRPOValidationConfig,
     GRPOValidationManager,
     prepare_validation_contract,
+    validate_full_candidate_training_schedule,
 )
 from r2r_evaluation import (  # noqa: E402
     DEFAULT_NATIVE_MAX_NEW_TOKENS,
@@ -148,6 +151,12 @@ def _run(args: argparse.Namespace, distributed: DistributedContext) -> None:
         max_trainable_percentage=args.max_trainable_percentage,
     )
     validation_config = build_validation_config(args)
+    validate_full_candidate_training_schedule(
+        validation_config,
+        trainer_max_steps=optimization.trainer_max_steps,
+        save_steps=optimization.save_steps,
+        save_total_limit=optimization.save_total_limit,
+    )
 
     runtime_contract = audit_trl_runtime_contract()
     components = load_grpo_training_components(component_config)
@@ -249,8 +258,25 @@ def build_validation_config(
     args: argparse.Namespace,
 ) -> GRPOValidationConfig | None:
     if not args.validation:
+        if (
+            getattr(args, "validation_full_candidate_policy", None)
+            is not None
+            or getattr(
+                args, "validation_expected_full_candidate_count", None
+            )
+            is not None
+        ):
+            raise ValueError(
+                "Full-candidate validation options require --validation"
+            )
         return None
     validation_max_new_tokens = args.validation_max_new_tokens
+    full_candidate_policy = getattr(
+        args, "validation_full_candidate_policy", None
+    )
+    expected_full_candidate_count = getattr(
+        args, "validation_expected_full_candidate_count", None
+    )
     if args.resume_from_checkpoint is not None:
         recorded = load_grpo_run_manifest(args.output_dir)
         validation = recorded.get("validation", {})
@@ -270,6 +296,31 @@ def build_validation_config(
                 f"{validation_max_new_tokens}"
             )
         validation_max_new_tokens = recorded_max_new_tokens
+        recorded_policy = validation.get(
+            "full_candidate_policy",
+            FULL_CANDIDATE_POLICY_QUICK_BEST_AND_CURRENT,
+        )
+        recorded_count = validation.get("expected_full_candidate_count")
+        if (
+            full_candidate_policy is not None
+            and full_candidate_policy != recorded_policy
+        ):
+            raise ValueError(
+                "Checkpoint resume must retain its recorded validation "
+                f"full_candidate_policy={recorded_policy}, received "
+                f"{full_candidate_policy}"
+            )
+        if (
+            expected_full_candidate_count is not None
+            and expected_full_candidate_count != recorded_count
+        ):
+            raise ValueError(
+                "Checkpoint resume must retain its recorded validation "
+                "expected_full_candidate_count="
+                f"{recorded_count}, received {expected_full_candidate_count}"
+            )
+        full_candidate_policy = recorded_policy
+        expected_full_candidate_count = recorded_count
     if validation_max_new_tokens is None:
         validation_max_new_tokens = DEFAULT_NATIVE_MAX_NEW_TOKENS
     if (
@@ -279,6 +330,10 @@ def build_validation_config(
         raise ValueError(
             "New training runs must use the formal validation "
             f"max_new_tokens={DEFAULT_NATIVE_MAX_NEW_TOKENS}"
+        )
+    if full_candidate_policy is None:
+        full_candidate_policy = (
+            FULL_CANDIDATE_POLICY_QUICK_BEST_AND_CURRENT
         )
     return GRPOValidationConfig(
         evaluation=R2REvaluationConfig(
@@ -300,6 +355,8 @@ def build_validation_config(
         fast_subset_seed=args.validation_seed,
         fast_interval_steps=args.validation_fast_interval_steps,
         progress_interval=args.validation_progress_interval,
+        full_candidate_policy=full_candidate_policy,
+        expected_full_candidate_count=expected_full_candidate_count,
     )
 
 
@@ -601,6 +658,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--validation-fast-interval-steps",
         type=int,
         default=1_000,
+    )
+    parser.add_argument(
+        "--validation-full-candidate-policy",
+        choices=tuple(sorted(FULL_CANDIDATE_POLICIES)),
+        default=None,
+        help=(
+            "full Val-Unseen candidate set: the default keeps the current "
+            "checkpoint plus fast quick-best; all_fast_snapshots evaluates "
+            "every scheduled fast snapshot and requires an exact count"
+        ),
+    )
+    parser.add_argument(
+        "--validation-expected-full-candidate-count",
+        type=int,
+        default=None,
+        help=(
+            "required exact periodic snapshot count for "
+            "--validation-full-candidate-policy all_fast_snapshots"
+        ),
     )
     parser.add_argument(
         "--validation-max-new-tokens",

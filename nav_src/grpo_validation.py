@@ -41,6 +41,14 @@ EPOCH_END_FULL_REASON = "epoch_end"
 TRAIN_END_FULL_REASON = "train_end"
 _FULL_REASONS = {EPOCH_END_FULL_REASON, TRAIN_END_FULL_REASON}
 
+FULL_CANDIDATE_POLICY_QUICK_BEST_AND_CURRENT = "quick_best_and_current"
+FULL_CANDIDATE_POLICY_ALL_FAST_SNAPSHOTS = "all_fast_snapshots"
+FULL_CANDIDATE_POLICIES = {
+    FULL_CANDIDATE_POLICY_QUICK_BEST_AND_CURRENT,
+    FULL_CANDIDATE_POLICY_ALL_FAST_SNAPSHOTS,
+}
+PERIODIC_FAST_SNAPSHOT_ROLE = "periodic_fast_snapshot"
+
 
 @dataclass(frozen=True)
 class GRPOValidationConfig:
@@ -50,6 +58,10 @@ class GRPOValidationConfig:
     fast_subset_seed: int = 0
     fast_interval_steps: int = 1_000
     progress_interval: int = 10
+    full_candidate_policy: str = (
+        FULL_CANDIDATE_POLICY_QUICK_BEST_AND_CURRENT
+    )
+    expected_full_candidate_count: Optional[int] = None
 
     def __post_init__(self) -> None:
         if min(
@@ -58,6 +70,29 @@ class GRPOValidationConfig:
             self.progress_interval,
         ) <= 0:
             raise ValueError("Validation sizes and intervals must be positive")
+        if self.full_candidate_policy not in FULL_CANDIDATE_POLICIES:
+            raise ValueError(
+                "full_candidate_policy must be one of "
+                f"{sorted(FULL_CANDIDATE_POLICIES)}"
+            )
+        if (
+            self.full_candidate_policy
+            == FULL_CANDIDATE_POLICY_ALL_FAST_SNAPSHOTS
+        ):
+            if (
+                isinstance(self.expected_full_candidate_count, bool)
+                or not isinstance(self.expected_full_candidate_count, int)
+                or self.expected_full_candidate_count <= 0
+            ):
+                raise ValueError(
+                    "all_fast_snapshots requires a positive "
+                    "expected_full_candidate_count"
+                )
+        elif self.expected_full_candidate_count is not None:
+            raise ValueError(
+                "expected_full_candidate_count is only valid with "
+                "all_fast_snapshots"
+            )
 
     @property
     def subset_path(self) -> Path:
@@ -88,8 +123,54 @@ def prepare_validation_contract(
         "progress_interval": config.progress_interval,
         "selection": ["spl", "sr", "nDTW", "lower_nav_error", "earlier_step"],
     }
+    # Keep the legacy/default contract byte-for-byte compatible with existing
+    # resumable runs. The opt-in exhaustive policy is explicit and
+    # fingerprinted for every new run that enables it.
+    if (
+        config.full_candidate_policy
+        != FULL_CANDIDATE_POLICY_QUICK_BEST_AND_CURRENT
+    ):
+        body["full_candidate_policy"] = config.full_candidate_policy
+        body["expected_full_candidate_count"] = int(
+            config.expected_full_candidate_count
+        )
     body["validation_fingerprint"] = sha256_text(canonical_json(body))
     return body
+
+
+def validate_full_candidate_training_schedule(
+    config: Optional[GRPOValidationConfig],
+    *,
+    trainer_max_steps: int,
+    save_steps: int,
+    save_total_limit: int,
+) -> None:
+    """Fail before training when exhaustive full-candidate capture can drift."""
+
+    if (
+        config is None
+        or config.full_candidate_policy
+        != FULL_CANDIDATE_POLICY_ALL_FAST_SNAPSHOTS
+    ):
+        return
+    count = int(config.expected_full_candidate_count)
+    expected_max_steps = int(config.fast_interval_steps) * count
+    if int(trainer_max_steps) != expected_max_steps:
+        raise ValueError(
+            "all_fast_snapshots requires trainer_max_steps == "
+            "validation_fast_interval_steps * expected_full_candidate_count: "
+            f"expected {expected_max_steps}, received {trainer_max_steps}"
+        )
+    if int(save_steps) != int(config.fast_interval_steps):
+        raise ValueError(
+            "all_fast_snapshots requires save_steps to equal "
+            f"validation_fast_interval_steps={config.fast_interval_steps}"
+        )
+    if int(save_total_limit) < count:
+        raise ValueError(
+            "all_fast_snapshots requires save_total_limit >= "
+            f"expected_full_candidate_count={count}"
+        )
 
 
 class GRPOValidationManager:
@@ -343,6 +424,7 @@ class GRPOValidationManager:
             raise GRPOValidationError(
                 "Completed full-validation event has no candidates"
             )
+        self._validate_recorded_full_candidates(event, candidates)
         if not any(
             reason in value.get("roles", [])
             for value in candidates
@@ -804,12 +886,46 @@ class GRPOValidationManager:
             if row["event_id"] == event_id
         )
         if event["full_candidates"]:
+            self._validate_recorded_full_candidates(
+                event, event["full_candidates"]
+            )
             return tuple(event["full_candidates"])
         full_reason = self._full_reason(event)
         if full_reason is None:
             raise GRPOValidationError(
                 "Full candidates requested for a fast-only event"
             )
+        if (
+            self.config.full_candidate_policy
+            == FULL_CANDIDATE_POLICY_ALL_FAST_SNAPSHOTS
+        ):
+            grouped = self._all_fast_snapshot_groups(
+                current_snapshot=current_snapshot,
+                full_reason=full_reason,
+            )
+        else:
+            grouped = self._quick_best_and_current_groups(
+                current_snapshot=current_snapshot,
+                full_reason=full_reason,
+            )
+        candidates = []
+        for value in sorted(
+            grouped.values(), key=lambda row: int(row["snapshot"]["step"])
+        ):
+            job = self._enqueue_job(value["snapshot"], "full")
+            candidates.append(
+                {"job_id": str(job["job_id"]), "roles": list(value["roles"])}
+            )
+        self._validate_recorded_full_candidates(event, candidates)
+        self.queue.update_event(event_id, full_candidates=candidates)
+        return tuple(candidates)
+
+    def _quick_best_and_current_groups(
+        self,
+        *,
+        current_snapshot: Mapping[str, Any],
+        full_reason: str,
+    ) -> Dict[str, Dict[str, Any]]:
         grouped: Dict[str, Dict[str, Any]] = {
             str(current_snapshot["fingerprint"]): {
                 "snapshot": dict(current_snapshot),
@@ -829,14 +945,161 @@ class GRPOValidationManager:
                     "snapshot": snapshot.as_dict(),
                     "roles": ["quick_best"],
                 }
-        candidates = []
-        for value in grouped.values():
-            job = self._enqueue_job(value["snapshot"], "full")
-            candidates.append(
-                {"job_id": str(job["job_id"]), "roles": list(value["roles"])}
+        return grouped
+
+    def _all_fast_snapshot_groups(
+        self,
+        *,
+        current_snapshot: Mapping[str, Any],
+        full_reason: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        count = int(self.config.expected_full_candidate_count)
+        interval = int(self.config.fast_interval_steps)
+        expected_steps = tuple(interval * index for index in range(1, count + 1))
+        state = self.selector.read()
+        history = state.get("fast_history")
+        if not isinstance(history, list):
+            raise GRPOValidationError("Fast-validation history is invalid")
+        observed_steps = tuple(
+            int(row.get("step", -1))
+            for row in history
+            if isinstance(row, Mapping)
+        )
+        if len(history) != count or observed_steps != expected_steps:
+            raise GRPOValidationError(
+                "Exhaustive full validation requires exactly the scheduled "
+                f"fast snapshots: expected steps={list(expected_steps)}, "
+                f"observed steps={list(observed_steps)}"
             )
-        self.queue.update_event(event_id, full_candidates=candidates)
-        return tuple(candidates)
+        if int(current_snapshot.get("step", -1)) != expected_steps[-1]:
+            raise GRPOValidationError(
+                "Exhaustive full validation was requested from the wrong "
+                f"terminal snapshot: expected step {expected_steps[-1]}"
+            )
+
+        quick = state.get("quick_best")
+        if not isinstance(quick, Mapping):
+            raise GRPOValidationError(
+                "Exhaustive full validation requires a completed quick_best"
+            )
+        quick_fingerprint = str(quick.get("snapshot_fingerprint", ""))
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for row, expected_step in zip(history, expected_steps):
+            job_id = str(row.get("job_id", ""))
+            if job_id != f"fast-step-{expected_step}":
+                raise GRPOValidationError(
+                    "Fast-validation history job identity changed at "
+                    f"step {expected_step}"
+                )
+            job = self._validate_completed_job(self.queue.job(job_id))
+            if (
+                job.get("mode") != "fast"
+                or int(job.get("step", -1)) != expected_step
+                or canonical_json(row.get("metrics"))
+                != canonical_json(job.get("result", {}).get("metrics"))
+            ):
+                raise GRPOValidationError(
+                    f"Scheduled fast candidate changed at step {expected_step}"
+                )
+            snapshot = job.get("snapshot")
+            if not isinstance(snapshot, Mapping):
+                raise GRPOValidationError(
+                    "Scheduled fast candidate lost its snapshot at step "
+                    f"{expected_step}"
+                )
+            fingerprint = str(snapshot.get("fingerprint", ""))
+            if not fingerprint or fingerprint in grouped:
+                raise GRPOValidationError(
+                    "Exhaustive full-validation snapshots are not unique"
+                )
+            roles = [PERIODIC_FAST_SNAPSHOT_ROLE]
+            if fingerprint == str(current_snapshot.get("fingerprint", "")):
+                roles.append(full_reason)
+            if fingerprint == quick_fingerprint:
+                roles.append("quick_best")
+            grouped[fingerprint] = {
+                "snapshot": dict(snapshot),
+                "roles": roles,
+            }
+
+        current_fingerprint = str(current_snapshot.get("fingerprint", ""))
+        if current_fingerprint not in grouped:
+            raise GRPOValidationError(
+                "Terminal snapshot is absent from exhaustive fast history"
+            )
+        if quick_fingerprint not in grouped:
+            raise GRPOValidationError(
+                "quick_best is absent from exhaustive fast history"
+            )
+        return grouped
+
+    def _validate_recorded_full_candidates(
+        self,
+        event: Mapping[str, Any],
+        candidates: Sequence[Mapping[str, Any]],
+    ) -> None:
+        if (
+            self.config.full_candidate_policy
+            != FULL_CANDIDATE_POLICY_ALL_FAST_SNAPSHOTS
+        ):
+            return
+        count = int(self.config.expected_full_candidate_count)
+        interval = int(self.config.fast_interval_steps)
+        expected_steps = tuple(interval * index for index in range(1, count + 1))
+        if int(event.get("step", -1)) != expected_steps[-1]:
+            raise GRPOValidationError(
+                "Recorded exhaustive full event is not at the configured "
+                f"terminal step {expected_steps[-1]}"
+            )
+        if len(candidates) != count:
+            raise GRPOValidationError(
+                "Recorded exhaustive full-candidate count changed: "
+                f"expected {count}, observed {len(candidates)}"
+            )
+        observed_steps = []
+        full_reason = self._full_reason(event)
+        quick = self.selector.read().get("quick_best")
+        if not isinstance(quick, Mapping):
+            raise GRPOValidationError(
+                "Recorded exhaustive candidates lost quick_best"
+            )
+        quick_fingerprint = str(quick.get("snapshot_fingerprint", ""))
+        for candidate, expected_step in zip(candidates, expected_steps):
+            if not isinstance(candidate, Mapping):
+                raise GRPOValidationError("Recorded full candidate is invalid")
+            expected_job_id = f"full-step-{expected_step}"
+            job = self.queue.job(str(candidate.get("job_id", "")))
+            roles = candidate.get("roles")
+            snapshot = job.get("snapshot")
+            fingerprint = (
+                str(snapshot.get("fingerprint", ""))
+                if isinstance(snapshot, Mapping)
+                else ""
+            )
+            expected_roles = {PERIODIC_FAST_SNAPSHOT_ROLE}
+            if expected_step == expected_steps[-1]:
+                expected_roles.add(str(full_reason))
+            if fingerprint == quick_fingerprint:
+                expected_roles.add("quick_best")
+            if (
+                candidate.get("job_id") != expected_job_id
+                or job.get("mode") != "full"
+                or int(job.get("step", -1)) != expected_step
+                or not isinstance(roles, list)
+                or len(roles) != len(set(roles))
+                or set(roles) != expected_roles
+            ):
+                raise GRPOValidationError(
+                    "Recorded exhaustive full candidate changed at step "
+                    f"{expected_step}"
+                )
+            observed_steps.append(int(job["step"]))
+        if tuple(observed_steps) != expected_steps or not any(
+            "quick_best" in candidate["roles"] for candidate in candidates
+        ):
+            raise GRPOValidationError(
+                "Recorded exhaustive full-candidate identities changed"
+            )
 
     def _select_epoch(
         self, event_id: str, *, step: int, epoch: Any

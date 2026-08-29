@@ -30,10 +30,13 @@ from grpo_eval_artifacts import (  # noqa: E402
     completed_candidate,
 )
 from grpo_validation import (  # noqa: E402
+    FULL_CANDIDATE_POLICY_ALL_FAST_SNAPSHOTS,
     GRPOValidationManager,
     GRPOValidationError,
+    PERIODIC_FAST_SNAPSHOT_ROLE,
     TRAIN_END_FULL_REASON,
     make_grpo_validation_callback,
+    validate_full_candidate_training_schedule,
     validate_completed_native_job_output,
 )
 from action_plan_cache import canonical_json, sha256_file, sha256_text  # noqa: E402
@@ -66,6 +69,7 @@ from r2r_evaluation import (  # noqa: E402
 )
 from scripts import evaluate_r2r_native  # noqa: E402
 from scripts import train_grpo  # noqa: E402
+import grpo_validation as grpo_validation_module  # noqa: E402
 
 
 def require(condition: bool, message: str) -> None:
@@ -1456,6 +1460,151 @@ def test_training_validation_budget_migration(root: Path) -> None:
     finally:
         train_grpo.load_grpo_run_manifest = original_loader
 
+    exhaustive = parser.parse_args(
+        [
+            "--max-completion-length",
+            "4096",
+            "--validation",
+            "--output-dir",
+            str(root / "exhaustive-run"),
+            "--trainer-max-steps",
+            "1000",
+            "--save-steps",
+            "100",
+            "--save-total-limit",
+            "10",
+            "--validation-fast-interval-steps",
+            "100",
+            "--validation-full-candidate-policy",
+            FULL_CANDIDATE_POLICY_ALL_FAST_SNAPSHOTS,
+            "--validation-expected-full-candidate-count",
+            "10",
+        ]
+    )
+    exhaustive_config = train_grpo.build_validation_config(exhaustive)
+    require(
+        exhaustive_config.full_candidate_policy
+        == FULL_CANDIDATE_POLICY_ALL_FAST_SNAPSHOTS
+        and exhaustive_config.expected_full_candidate_count == 10,
+        "The exhaustive full-candidate CLI contract was not constructed",
+    )
+    disabled = copy.copy(exhaustive)
+    disabled.validation = False
+    require_raises(
+        ValueError,
+        lambda: train_grpo.build_validation_config(disabled),
+        "Exhaustive candidate options were accepted without --validation",
+    )
+    validate_full_candidate_training_schedule(
+        exhaustive_config,
+        trainer_max_steps=1_000,
+        save_steps=100,
+        save_total_limit=10,
+    )
+    for values, label in (
+        ((900, 100, 10), "terminal step"),
+        ((1_000, 50, 10), "save interval"),
+        ((1_000, 100, 9), "checkpoint retention"),
+    ):
+        require_raises(
+            ValueError,
+            lambda values=values: validate_full_candidate_training_schedule(
+                exhaustive_config,
+                trainer_max_steps=values[0],
+                save_steps=values[1],
+                save_total_limit=values[2],
+            ),
+            f"Exhaustive validation accepted a mismatched {label}",
+        )
+
+    resumed_exhaustive = copy.copy(exhaustive)
+    resumed_exhaustive.resume_from_checkpoint = "checkpoint-500"
+    original_loader = train_grpo.load_grpo_run_manifest
+    train_grpo.load_grpo_run_manifest = lambda _: {
+        "validation": {
+            "evaluation": {"max_new_tokens": DEFAULT_NATIVE_MAX_NEW_TOKENS},
+            "full_candidate_policy": FULL_CANDIDATE_POLICY_ALL_FAST_SNAPSHOTS,
+            "expected_full_candidate_count": 10,
+        }
+    }
+    try:
+        resumed_exhaustive.validation_full_candidate_policy = None
+        resumed_exhaustive.validation_expected_full_candidate_count = None
+        inherited = train_grpo.build_validation_config(resumed_exhaustive)
+        require(
+            inherited.full_candidate_policy
+            == FULL_CANDIDATE_POLICY_ALL_FAST_SNAPSHOTS
+            and inherited.expected_full_candidate_count == 10,
+            "Resume did not inherit the exhaustive candidate contract",
+        )
+        changed = copy.copy(resumed_exhaustive)
+        changed.validation_expected_full_candidate_count = 9
+        require_raises(
+            ValueError,
+            lambda: train_grpo.build_validation_config(changed),
+            "Resume accepted a changed exhaustive candidate count",
+        )
+    finally:
+        train_grpo.load_grpo_run_manifest = original_loader
+
+
+def test_exhaustive_candidate_manifest_contract(root: Path) -> None:
+    subset = root / "manifest-fast-subset.json"
+    subset.write_text("{}\n", encoding="utf-8")
+    evaluation = SimpleNamespace(
+        annotation=str(root / "manifest-val.json"),
+        expected_instruction_count=2_349,
+        validate=lambda: None,
+        identity=lambda: {
+            "max_new_tokens": DEFAULT_NATIVE_MAX_NEW_TOKENS,
+            "expected_instruction_count": 2_349,
+        },
+    )
+    common = {
+        "evaluation": evaluation,
+        "subset_path": subset,
+        "fast_subset_size": 128,
+        "fast_subset_seed": 0,
+        "fast_interval_steps": 100,
+        "progress_interval": 10,
+    }
+    original_prepare = grpo_validation_module.prepare_fast_subset_manifest
+    grpo_validation_module.prepare_fast_subset_manifest = lambda *args, **kwargs: {}
+    try:
+        exhaustive = grpo_validation_module.prepare_validation_contract(
+            SimpleNamespace(
+                **common,
+                full_candidate_policy=FULL_CANDIDATE_POLICY_ALL_FAST_SNAPSHOTS,
+                expected_full_candidate_count=10,
+            )
+        )
+        require(
+            exhaustive["full_candidate_policy"]
+            == FULL_CANDIDATE_POLICY_ALL_FAST_SNAPSHOTS
+            and exhaustive["expected_full_candidate_count"] == 10,
+            "The exhaustive candidate policy was omitted from the manifest",
+        )
+        fingerprint = exhaustive.pop("validation_fingerprint")
+        require(
+            fingerprint == sha256_text(canonical_json(exhaustive)),
+            "The exhaustive candidate policy is outside the validation fingerprint",
+        )
+
+        legacy = grpo_validation_module.prepare_validation_contract(
+            SimpleNamespace(
+                **common,
+                full_candidate_policy="quick_best_and_current",
+                expected_full_candidate_count=None,
+            )
+        )
+        require(
+            "full_candidate_policy" not in legacy
+            and "expected_full_candidate_count" not in legacy,
+            "The default policy broke historical validation fingerprints",
+        )
+    finally:
+        grpo_validation_module.prepare_fast_subset_manifest = original_prepare
+
 
 def test_legacy_evaluator_boundary(root: Path) -> None:
     common = [
@@ -1867,6 +2016,147 @@ class SingleProcessLedger:
         return function()
 
 
+def _build_exhaustive_candidate_manager(
+    root: Path, *, steps: tuple[int, ...]
+) -> tuple[GRPOValidationManager, Dict[str, Any], str]:
+    validation_dir = root / "validation"
+    queue = EvaluationQueue(
+        str(validation_dir / "queue.json"),
+        run_fingerprint="run",
+        validation_fingerprint="validation",
+    )
+    queue.initialize()
+    selector = BestSelector(
+        str(validation_dir / "state.json"),
+        run_fingerprint="run",
+        validation_fingerprint="validation",
+    )
+    selector.initialize()
+    snapshots = {}
+    for step in steps:
+        snapshot = {
+            "step": step,
+            "path": str(validation_dir / f"snapshots/step-{step}"),
+            "fingerprint": f"snapshot-{step}",
+            "weights_sha256": f"weights-{step}",
+        }
+        snapshots[step] = snapshot
+        job = queue.enqueue_job(
+            {
+                "job_id": f"fast-step-{step}",
+                "mode": "fast",
+                "step": step,
+                "snapshot": snapshot,
+                "output_path": str(
+                    validation_dir / f"evaluations/fast/step-{step}"
+                ),
+            }
+        )
+        completed = queue.mark_completed(
+            str(job["job_id"]),
+            {
+                "count": 128,
+                "metrics": {
+                    "spl": 90.0 if step == 600 else float(step) / 100.0,
+                    "sr": 50.0,
+                    "nDTW": 40.0,
+                    "nav_error": 5.0,
+                },
+            },
+        )
+        selector.record_fast(completed)
+
+    event_id = "step-1000-fast-0-train-end"
+    queue.enqueue_event(
+        {
+            "event_id": event_id,
+            "step": 1_000,
+            "source_path": str(root / "checkpoint-1000"),
+            "fast_due": False,
+            "epoch_due": True,
+            "epoch": 0.1,
+        }
+    )
+    manager = GRPOValidationManager.__new__(GRPOValidationManager)
+    manager.validation_dir = validation_dir
+    manager.queue = queue
+    manager.selector = selector
+    manager.config = SimpleNamespace(
+        full_candidate_policy=FULL_CANDIDATE_POLICY_ALL_FAST_SNAPSHOTS,
+        expected_full_candidate_count=10,
+        fast_interval_steps=100,
+    )
+    manager._validate_selector_state = lambda: True
+    manager._validate_completed_job = lambda job: dict(job)
+    return manager, snapshots[1_000], event_id
+
+
+def test_all_fast_snapshot_full_candidates(root: Path) -> None:
+    scheduled_steps = tuple(range(100, 1_001, 100))
+    manager, current_snapshot, event_id = _build_exhaustive_candidate_manager(
+        root / "exhaustive-candidates", steps=scheduled_steps
+    )
+    candidates = manager._prepare_full_candidates(event_id, current_snapshot)
+    require(
+        [row["job_id"] for row in candidates]
+        == [f"full-step-{step}" for step in scheduled_steps],
+        "The exhaustive full queue omitted or reordered a periodic snapshot",
+    )
+    require(
+        all(PERIODIC_FAST_SNAPSHOT_ROLE in row["roles"] for row in candidates),
+        "A periodic full candidate lost its provenance role",
+    )
+    require(
+        sum("quick_best" in row["roles"] for row in candidates) == 1
+        and TRAIN_END_FULL_REASON in candidates[-1]["roles"],
+        "Quick-best or terminal lifecycle roles were not preserved",
+    )
+    require(
+        manager._prepare_full_candidates(event_id, current_snapshot)
+        == candidates,
+        "Persisted exhaustive candidates were not resumable and idempotent",
+    )
+    queue_state = manager.queue.read()
+    require(
+        len(queue_state["jobs"]) == 20
+        and len(queue_state["events"][0]["full_candidates"]) == 10,
+        "Fast and full jobs were not completely recorded in the queue",
+    )
+
+    for step in scheduled_steps:
+        manager.queue.mark_completed(
+            f"full-step-{step}",
+            {
+                "count": 2_349,
+                "metrics": {
+                    "spl": 80.0 if step == 700 else float(step) / 100.0,
+                    "sr": 60.0,
+                    "nDTW": 50.0,
+                    "nav_error": 4.0,
+                },
+            },
+        )
+    selected = manager._select_epoch(event_id, step=1_000, epoch=0.1)
+    require(
+        selected["full_best"]["step"] == 700,
+        "The canonical full selector did not choose one winner from all ten",
+    )
+
+    missing_steps = tuple(step for step in scheduled_steps if step != 500)
+    missing, terminal, missing_event = _build_exhaustive_candidate_manager(
+        root / "missing-exhaustive-candidate", steps=missing_steps
+    )
+    require_raises(
+        GRPOValidationError,
+        lambda: missing._prepare_full_candidates(missing_event, terminal),
+        "Exhaustive validation accepted a missing periodic snapshot",
+    )
+    require(
+        all(job["mode"] == "fast" for job in missing.queue.read()["jobs"]),
+        "A missing snapshot failed only after full jobs were enqueued",
+    )
+
+
 def test_max_step_validation_lifecycle(root: Path) -> None:
     args = SimpleNamespace(output_dir=str(root / "max-step-run"), max_steps=750)
 
@@ -2022,12 +2312,14 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="navgpt-r2r-contract-") as temp:
         root = Path(temp)
         test_max_step_validation_lifecycle(root)
+        test_all_fast_snapshot_full_candidates(root)
         test_native_tool_envelope()
         test_native_cli_contract(root)
         test_full_best_resolver_and_cli_short_circuit(root)
         test_incompatible_partial_evaluation_quarantine(root)
         test_legacy_completed_job_compatibility(root)
         test_training_validation_budget_migration(root)
+        test_exhaustive_candidate_manifest_contract(root)
         test_legacy_evaluator_boundary(root)
         test_two_turn_native_runner()
         test_metric_parity_with_legacy_formula()
@@ -2279,6 +2571,7 @@ def main() -> None:
     print("- rank JSONL recovery and exact coverage")
     print("- immutable eval snapshot and resumable evaluation queue")
     print("- idempotent max-step train-end full validation and epoch reuse")
+    print("- exact periodic snapshot set plus resumable ten-candidate full selection")
     print("- completed queue jobs are revalidated before best selection")
     print("- SPL-first quick/full best selector")
     print("- two-epoch 1000-step fast plus epoch-end full scheduling")
