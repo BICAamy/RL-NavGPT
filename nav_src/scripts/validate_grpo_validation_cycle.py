@@ -331,7 +331,17 @@ def _assert_final_state(
     )
     require(
         len(queue["events"]) == 3,
-        f"Expected two fast events and one epoch event: {queue['events']}",
+        f"Expected two fast events and one full event: {queue['events']}",
+    )
+    full_events = [row for row in queue["events"] if row["epoch_due"]]
+    require(
+        len(full_events) == 1
+        and any(
+            role in {"epoch_end", "train_end"}
+            for candidate in full_events[0]["full_candidates"]
+            for role in candidate["roles"]
+        ),
+        "Final full event lost its epoch-end/train-end lifecycle role",
     )
     full_ids = tuple(
         str(row["instr_id"])
@@ -386,7 +396,7 @@ def _assert_final_state(
     )
     fast_steps = [int(row["step"]) for row in state["fast_history"]]
     require(fast_steps == [1, 2], f"Unexpected fast history: {fast_steps}")
-    require(len(state["epoch_history"]) == 1, "Epoch-end selection did not run")
+    require(len(state["epoch_history"]) == 1, "Final full selection did not run")
     require(state["quick_best"] is not None, "quick-best was not selected")
     require(state["full_best"] is not None, "full-best was not selected")
     fast_jobs = [row for row in queue["jobs"] if row["mode"] == "fast"]
@@ -450,6 +460,14 @@ def _assert_final_state(
         "world_size": world_size,
         "interruption": dict(interrupted),
         "fast_steps": fast_steps,
+        "final_full_event_id": str(full_events[0]["event_id"]),
+        "final_full_roles": sorted(
+            {
+                str(role)
+                for candidate in full_events[0]["full_candidates"]
+                for role in candidate["roles"]
+            }
+        ),
         "evaluation_event_count": len(queue["events"]),
         "evaluation_job_count": len(queue["jobs"]),
         "full_job_count": len(full_jobs),
@@ -589,7 +607,11 @@ def main() -> None:
     )
     print("- training was interrupted with fast-step-1 persisted in the queue")
     print("- evaluation-only drained the queue without an optimizer step")
-    print("- checkpoint-1 resumed through step 2 and epoch-end full selection")
+    print("- checkpoint-1 resumed through max step 2 and final full selection")
+    print(
+        f"- final_full_event={report['final_full_event_id']} "
+        f"roles={report['final_full_roles']}"
+    )
     print(f"- full_best={report['full_best']['adapter_path']}")
     print(f"- report={root / 'report.json'}")
 

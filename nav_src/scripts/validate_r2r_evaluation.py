@@ -32,6 +32,7 @@ from grpo_eval_artifacts import (  # noqa: E402
 from grpo_validation import (  # noqa: E402
     GRPOValidationManager,
     GRPOValidationError,
+    TRAIN_END_FULL_REASON,
     make_grpo_validation_callback,
     validate_completed_native_job_output,
 )
@@ -1838,14 +1839,189 @@ class FakeManager:
     def __init__(self) -> None:
         self.config = SimpleNamespace(fast_interval_steps=1_000)
         self.calls = []
+        self.train_end_calls = []
+        self.full_steps = set()
 
     def run_scheduled_checkpoint(self, **kwargs):
+        if not kwargs["fast_due"] and not kwargs["epoch_due"]:
+            return
         self.calls.append(kwargs)
+        if kwargs["epoch_due"]:
+            self.full_steps.add(int(kwargs["step"]))
+
+    def ensure_train_end_validation(self, **kwargs):
+        self.train_end_calls.append(kwargs)
+        step = int(kwargs["step"])
+        if step in self.full_steps:
+            return
+        self.run_scheduled_checkpoint(
+            **kwargs,
+            fast_due=False,
+            epoch_due=True,
+            full_reason=TRAIN_END_FULL_REASON,
+        )
+
+
+class SingleProcessLedger:
+    def call_on_main_and_broadcast(self, function):
+        return function()
+
+
+def test_max_step_validation_lifecycle(root: Path) -> None:
+    args = SimpleNamespace(output_dir=str(root / "max-step-run"), max_steps=750)
+
+    manager = FakeManager()
+    callback = make_grpo_validation_callback(
+        manager,
+        transformers_module=SimpleNamespace(TrainerCallback=object),
+    )
+    state = SimpleNamespace(global_step=750, epoch=0.125)
+    control = SimpleNamespace(should_save=False)
+    callback.on_step_end(args, state, control)
+    require(control.should_save, "The max-step boundary did not force a checkpoint")
+    callback.on_save(args, state, control)
+    callback.on_train_end(args, state, control)
+    callback.on_train_end(args, state, control)
+    require(
+        len(manager.calls) == 1
+        and manager.calls[0]["full_reason"] == TRAIN_END_FULL_REASON,
+        "Train end did not schedule one idempotent full validation",
+    )
+    require(
+        len(manager.train_end_calls) == 2,
+        "Repeated train-end delivery was not exercised",
+    )
+
+    manager = FakeManager()
+    callback = make_grpo_validation_callback(
+        manager,
+        transformers_module=SimpleNamespace(TrainerCallback=object),
+    )
+    state = SimpleNamespace(global_step=750, epoch=1.0)
+    control = SimpleNamespace(should_save=False)
+    callback.on_step_end(args, state, control)
+    callback.on_epoch_end(args, state, control)
+    callback.on_save(args, state, control)
+    callback.on_train_end(args, state, control)
+    require(
+        len(manager.calls) == 1
+        and manager.calls[0]["epoch_due"]
+        and "full_reason" not in manager.calls[0],
+        "An epoch/max-step boundary duplicated its full validation",
+    )
+
+    early = SimpleNamespace(global_step=749, epoch=0.124)
+    control = SimpleNamespace(should_save=False)
+    callback.on_step_end(args, early, control)
+    callback.on_train_end(args, early, control)
+    require(
+        not control.should_save and len(manager.train_end_calls) == 1,
+        "A pre-max-step stop was treated as normal max-step completion",
+    )
+
+    ledger_root = root / "max-step-ledger"
+    queue = EvaluationQueue(
+        str(ledger_root / "queue.json"),
+        run_fingerprint="run",
+        validation_fingerprint="validation",
+    )
+    queue.initialize()
+    ledger_manager = GRPOValidationManager.__new__(GRPOValidationManager)
+    ledger_manager.queue = queue
+    ledger_manager.distributed = SingleProcessLedger()
+    executed = []
+    validated = []
+
+    def complete_event(event):
+        executed.append(str(event["event_id"]))
+        queue.update_event(str(event["event_id"]), status="completed")
+
+    ledger_manager._execute_event = complete_event
+    ledger_manager._validate_completed_full_event = (
+        lambda event: validated.append(str(event["event_id"])) or True
+    )
+    checkpoint = ledger_root / "checkpoint-750"
+    ledger_manager.ensure_train_end_validation(
+        step=750,
+        checkpoint_path=str(checkpoint),
+        epoch=0.125,
+    )
+    ledger_manager.ensure_train_end_validation(
+        step=750,
+        checkpoint_path=str(checkpoint),
+        epoch=0.125,
+    )
+    events = queue.read()["events"]
+    require(
+        len(events) == 1
+        and events[0]["event_id"] == "step-750-fast-0-train-end"
+        and events[0]["status"] == "completed",
+        "Train-end queue identity was not immutable and idempotent",
+    )
+    require(
+        executed == ["step-750-fast-0-train-end"]
+        and validated == ["step-750-fast-0-train-end"],
+        "A completed train-end queue event was executed twice",
+    )
+
+    epoch_queue = EvaluationQueue(
+        str(root / "epoch-max-step-ledger/queue.json"),
+        run_fingerprint="run",
+        validation_fingerprint="validation",
+    )
+    epoch_queue.initialize()
+    epoch_manager = GRPOValidationManager.__new__(GRPOValidationManager)
+    epoch_manager.queue = epoch_queue
+    epoch_manager.distributed = SingleProcessLedger()
+    epoch_executed = []
+    epoch_validated = []
+
+    def complete_epoch_event(event):
+        epoch_executed.append(str(event["event_id"]))
+        epoch_queue.update_event(str(event["event_id"]), status="completed")
+
+    epoch_manager._execute_event = complete_epoch_event
+    epoch_manager._validate_completed_full_event = (
+        lambda event: epoch_validated.append(str(event["event_id"])) or True
+    )
+    epoch_checkpoint = root / "epoch-max-step-ledger/checkpoint-750"
+    epoch_manager.run_scheduled_checkpoint(
+        step=750,
+        checkpoint_path=str(epoch_checkpoint),
+        fast_due=False,
+        epoch_due=True,
+        epoch=1.0,
+    )
+    epoch_manager.ensure_train_end_validation(
+        step=750,
+        checkpoint_path=str(epoch_checkpoint),
+        epoch=1.0,
+    )
+    require(
+        len(epoch_queue.read()["events"]) == 1
+        and epoch_executed == ["step-750-fast-0-epoch-1"]
+        and epoch_validated == ["step-750-fast-0-epoch-1"],
+        "Train end did not reuse a completed same-step epoch event",
+    )
+
+    require_raises(
+        GRPOValidationError,
+        lambda: epoch_manager.run_scheduled_checkpoint(
+            step=751,
+            checkpoint_path=str(root / "checkpoint-751"),
+            fast_due=False,
+            epoch_due=True,
+            epoch=1.1,
+            full_reason="unknown",
+        ),
+        "An unknown full-validation lifecycle reason was accepted",
+    )
 
 
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="navgpt-r2r-contract-") as temp:
         root = Path(temp)
+        test_max_step_validation_lifecycle(root)
         test_native_tool_envelope()
         test_native_cli_contract(root)
         test_full_best_resolver_and_cli_short_circuit(root)
@@ -2102,6 +2278,7 @@ def main() -> None:
     print("- fixed Val-Unseen subset and standard metrics")
     print("- rank JSONL recovery and exact coverage")
     print("- immutable eval snapshot and resumable evaluation queue")
+    print("- idempotent max-step train-end full validation and epoch reuse")
     print("- completed queue jobs are revalidated before best selection")
     print("- SPL-first quick/full best selector")
     print("- two-epoch 1000-step fast plus epoch-end full scheduling")

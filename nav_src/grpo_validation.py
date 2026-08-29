@@ -37,6 +37,11 @@ class GRPOValidationError(RuntimeError):
     pass
 
 
+EPOCH_END_FULL_REASON = "epoch_end"
+TRAIN_END_FULL_REASON = "train_end"
+_FULL_REASONS = {EPOCH_END_FULL_REASON, TRAIN_END_FULL_REASON}
+
+
 @dataclass(frozen=True)
 class GRPOValidationConfig:
     evaluation: R2REvaluationConfig
@@ -146,6 +151,7 @@ class GRPOValidationManager:
             lambda: list(self.queue.pending_events())
         )
         for event in pending:
+            self._full_reason(event)
             if int(event["step"]) != int(current_step):
                 raise GRPOValidationError(
                     f"Pending validation is step {event['step']}, not {current_step}"
@@ -161,27 +167,126 @@ class GRPOValidationManager:
         fast_due: bool,
         epoch_due: bool,
         epoch: Optional[float],
+        full_reason: str = EPOCH_END_FULL_REASON,
     ) -> None:
         if not fast_due and not epoch_due:
             return
-        event = {
-            "event_id": (
+        if epoch_due and full_reason not in _FULL_REASONS:
+            raise GRPOValidationError(
+                f"Invalid full-validation reason: {full_reason}"
+            )
+        if not epoch_due and full_reason != EPOCH_END_FULL_REASON:
+            raise GRPOValidationError(
+                "A full-validation reason requires epoch_due=True"
+            )
+        if epoch_due and full_reason == TRAIN_END_FULL_REASON:
+            event_id = (
+                f"step-{int(step)}-fast-{int(bool(fast_due))}-train-end"
+            )
+        else:
+            # Keep the original event identity for epoch scheduling and for
+            # fast-only events so existing queues remain resumable.
+            event_id = (
                 f"step-{int(step)}-fast-{int(bool(fast_due))}"
                 f"-epoch-{int(bool(epoch_due))}"
-            ),
+            )
+        event = {
+            "event_id": event_id,
             "step": int(step),
             "source_path": str(Path(checkpoint_path).resolve()),
             "fast_due": bool(fast_due),
             "epoch_due": bool(epoch_due),
             "epoch": epoch,
         }
+        self._full_reason(event)
         queued = self.distributed.call_on_main_and_broadcast(
             lambda: self.queue.enqueue_event(event)
         )
         if queued["status"] != "completed":
             self._execute_event(queued)
 
+    def ensure_train_end_validation(
+        self,
+        *,
+        step: int,
+        checkpoint_path: str,
+        epoch: Optional[float],
+    ) -> None:
+        """Run one final full selection, or reuse a same-step full event.
+
+        A max-step boundary can also be an epoch boundary.  In that case the
+        epoch callback may already have completed the exact full-validation
+        lifecycle required at train end.  Reusing that immutable event avoids
+        a second selector decision and prevents evaluation artifacts from
+        being assigned two lifecycle identities.
+        """
+
+        step = int(step)
+        source_path = str(Path(checkpoint_path).resolve())
+
+        def same_step_full_events() -> Sequence[Dict[str, Any]]:
+            matches = []
+            for event in self.queue.read()["events"]:
+                reason = self._full_reason(event)
+                if int(event["step"]) == step and reason is not None:
+                    matches.append(dict(event))
+            return tuple(matches)
+
+        existing = self.distributed.call_on_main_and_broadcast(
+            same_step_full_events
+        )
+        if existing:
+            for event in existing:
+                if str(Path(str(event["source_path"])).resolve()) != source_path:
+                    raise GRPOValidationError(
+                        "Same-step full validation references another checkpoint"
+                    )
+                if event["status"] == "completed":
+                    self.distributed.call_on_main_and_broadcast(
+                        lambda event=event: self._validate_completed_full_event(
+                            event
+                        )
+                    )
+                else:
+                    self._execute_event(event)
+            return
+
+        self.run_scheduled_checkpoint(
+            step=step,
+            checkpoint_path=source_path,
+            fast_due=False,
+            epoch_due=True,
+            epoch=epoch,
+            full_reason=TRAIN_END_FULL_REASON,
+        )
+
+    @staticmethod
+    def _full_reason(event: Mapping[str, Any]) -> Optional[str]:
+        """Validate a persisted event ID and recover its full lifecycle role."""
+
+        try:
+            step = int(event["step"])
+            fast_due = bool(event["fast_due"])
+            epoch_due = bool(event["epoch_due"])
+            event_id = str(event["event_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GRPOValidationError(
+                "Validation event identity is incomplete"
+            ) from exc
+        legacy_id = (
+            f"step-{step}-fast-{int(fast_due)}-epoch-{int(epoch_due)}"
+        )
+        train_end_id = f"step-{step}-fast-{int(fast_due)}-train-end"
+        if event_id == legacy_id:
+            return EPOCH_END_FULL_REASON if epoch_due else None
+        if event_id == train_end_id and epoch_due:
+            return TRAIN_END_FULL_REASON
+        raise GRPOValidationError(
+            f"Validation event ID disagrees with its schedule: {event_id}"
+        )
+
     def _execute_event(self, event: Mapping[str, Any]) -> None:
+        self._full_reason(event)
         event_id = str(event["event_id"])
         event = self.distributed.call_on_main_and_broadcast(
             lambda: self.queue.update_event(event_id, status="running")
@@ -224,6 +329,47 @@ class GRPOValidationManager:
         self.distributed.call_on_main_and_broadcast(
             lambda: self.queue.update_event(event_id, status="completed")
         )
+
+    def _validate_completed_full_event(
+        self, event: Mapping[str, Any]
+    ) -> bool:
+        reason = self._full_reason(event)
+        if reason is None or event.get("status") != "completed":
+            raise GRPOValidationError(
+                "Train-end reuse requires a completed full-validation event"
+            )
+        candidates = event.get("full_candidates")
+        if not isinstance(candidates, list) or not candidates:
+            raise GRPOValidationError(
+                "Completed full-validation event has no candidates"
+            )
+        if not any(
+            reason in value.get("roles", [])
+            for value in candidates
+            if isinstance(value, Mapping)
+        ):
+            raise GRPOValidationError(
+                "Completed full-validation event lost its lifecycle role"
+            )
+        for value in candidates:
+            if not isinstance(value, Mapping):
+                raise GRPOValidationError(
+                    "Completed full-validation candidate is invalid"
+                )
+            self._validate_completed_job(
+                self.queue.job(str(value.get("job_id", "")))
+            )
+        history = self.selector.read().get("epoch_history")
+        if not isinstance(history, list) or not any(
+            row.get("event_id") == event["event_id"]
+            for row in history
+            if isinstance(row, Mapping)
+        ):
+            raise GRPOValidationError(
+                "Completed full-validation event is missing selector history"
+            )
+        self._validate_selector_state()
+        return True
 
     def _run_job(self, job: Mapping[str, Any]) -> Dict[str, Any]:
         if job["status"] == "completed":
@@ -659,10 +805,15 @@ class GRPOValidationManager:
         )
         if event["full_candidates"]:
             return tuple(event["full_candidates"])
+        full_reason = self._full_reason(event)
+        if full_reason is None:
+            raise GRPOValidationError(
+                "Full candidates requested for a fast-only event"
+            )
         grouped: Dict[str, Dict[str, Any]] = {
             str(current_snapshot["fingerprint"]): {
                 "snapshot": dict(current_snapshot),
-                "roles": ["epoch_end"],
+                "roles": [full_reason],
             }
         }
         quick = self.selector.read().get("quick_best")
@@ -722,9 +873,35 @@ def make_grpo_validation_callback(
             self.epoch_steps: Dict[int, float] = {}
             self.saved_steps = set()
 
+        @staticmethod
+        def _max_steps(args: Any) -> int:
+            try:
+                return int(getattr(args, "max_steps", -1))
+            except (TypeError, ValueError):
+                return -1
+
+        @staticmethod
+        def _epoch(state: Any) -> Optional[float]:
+            value = getattr(state, "epoch", None)
+            return None if value is None else float(value)
+
+        @staticmethod
+        def _checkpoint(args: Any, step: int) -> str:
+            return str(
+                Path(args.output_dir).resolve() / f"checkpoint-{int(step)}"
+            )
+
         def on_step_end(self, args: Any, state: Any, control: Any, **_: Any) -> Any:
             step = int(state.global_step)
-            if step and step % manager.config.fast_interval_steps == 0:
+            max_steps = self._max_steps(args)
+            fast_due = bool(
+                step and step % manager.config.fast_interval_steps == 0
+            )
+            # on_train_end cannot ask Trainer to materialize a checkpoint.
+            # Force the terminal optimizer step through the normal save path,
+            # where the checkpoint callback writes and audits all resume files.
+            max_step_due = bool(max_steps > 0 and step >= max_steps)
+            if fast_due or max_step_due:
                 control.should_save = True
             return control
 
@@ -734,9 +911,7 @@ def make_grpo_validation_callback(
             if step in self.saved_steps:
                 manager.run_scheduled_checkpoint(
                     step=step,
-                    checkpoint_path=str(
-                        Path(args.output_dir).resolve() / f"checkpoint-{step}"
-                    ),
+                    checkpoint_path=self._checkpoint(args, step),
                     fast_due=False,
                     epoch_due=True,
                     epoch=epoch,
@@ -753,12 +928,24 @@ def make_grpo_validation_callback(
             epoch = self.epoch_steps.pop(step, None)
             manager.run_scheduled_checkpoint(
                 step=step,
-                checkpoint_path=str(
-                    Path(args.output_dir).resolve() / f"checkpoint-{step}"
-                ),
+                checkpoint_path=self._checkpoint(args, step),
                 fast_due=bool(step and step % manager.config.fast_interval_steps == 0),
                 epoch_due=epoch is not None,
                 epoch=epoch,
+            )
+            return control
+
+        def on_train_end(
+            self, args: Any, state: Any, control: Any, **_: Any
+        ) -> Any:
+            step = int(state.global_step)
+            max_steps = self._max_steps(args)
+            if max_steps <= 0 or step < max_steps:
+                return control
+            manager.ensure_train_end_validation(
+                step=step,
+                checkpoint_path=self._checkpoint(args, step),
+                epoch=self._epoch(state),
             )
             return control
 
