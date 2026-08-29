@@ -29,11 +29,12 @@ from grpo_runtime import (  # noqa: E402
     SESSION_LOG_NAME,
 )
 from navigation_rewards import (  # noqa: E402
+    DISABLED_REWARD_METADATA_PROTOCOL,
     DISTANCE_POTENTIAL_PROGRESS_SHAPING,
 )
 
 
-AUDIT_SCHEMA_VERSION = 1
+AUDIT_SCHEMA_VERSION = 2
 DEFAULT_TARGETS = {
     "centered_pearson_min": 0.4,
     "pairwise_accuracy_min": 0.70,
@@ -411,6 +412,112 @@ def _thought_diagnostic_statistics(
     }
 
 
+def _reward_metadata_contract(
+    rows: Sequence[Mapping[str, Any]],
+    navigation_config: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Prove that ungrounded viewpoint metadata cannot affect reward."""
+
+    applicable = "reward_metadata_protocol" in navigation_config
+    protocol = str(navigation_config.get("reward_metadata_protocol", ""))
+    subgoal_reward = float(
+        navigation_config.get("subgoal_completion_reward", math.nan)
+    )
+    landmark_penalty = float(
+        navigation_config.get("landmark_deviation_penalty", math.nan)
+    )
+    subgoal_nonzero_rollout_count = 0
+    landmark_nonzero_rollout_count = 0
+    detailed_step_count = 0
+    metadata_nonempty_step_count = 0
+    metadata_ignored_step_count = 0
+    subgoal_enabled_step_count = 0
+    landmark_enabled_step_count = 0
+    diagnostic_protocol_counts: Counter[str] = Counter()
+
+    for row in rows:
+        components = row.get("reward_components", {})
+        if isinstance(components, Mapping):
+            subgoal_nonzero_rollout_count += int(
+                float(components.get("navigation/subgoal_completion", 0.0))
+                != 0.0
+            )
+            landmark_nonzero_rollout_count += int(
+                float(components.get("navigation/landmark_deviation", 0.0))
+                != 0.0
+            )
+        steps = row.get("trajectory_steps", [])
+        if not isinstance(steps, list):
+            continue
+        for step in steps:
+            if not isinstance(step, Mapping):
+                continue
+            diagnostics = step.get("reward_diagnostics", {})
+            if not isinstance(diagnostics, Mapping):
+                continue
+            detailed_step_count += 1
+            recorded_protocol = diagnostics.get(
+                "navigation/reward_metadata_protocol"
+            )
+            if recorded_protocol is not None:
+                diagnostic_protocol_counts[str(recorded_protocol)] += 1
+            metadata_nonempty_step_count += int(
+                diagnostics.get("navigation/reward_metadata_nonempty") is True
+            )
+            metadata_ignored_step_count += int(
+                diagnostics.get("navigation/reward_metadata_ignored") is True
+            )
+            subgoal_enabled_step_count += int(
+                diagnostics.get("navigation/subgoal_completion_enabled") is True
+            )
+            landmark_enabled_step_count += int(
+                diagnostics.get("navigation/landmark_deviation_enabled") is True
+            )
+
+    expected_diagnostic_count = diagnostic_protocol_counts.get(
+        DISABLED_REWARD_METADATA_PROTOCOL,
+        0,
+    )
+    passed = (
+        protocol == DISABLED_REWARD_METADATA_PROTOCOL
+        and subgoal_reward == 0.0
+        and landmark_penalty == 0.0
+        and subgoal_nonzero_rollout_count == 0
+        and landmark_nonzero_rollout_count == 0
+        and detailed_step_count > 0
+        and expected_diagnostic_count == detailed_step_count
+        and len(diagnostic_protocol_counts) == 1
+        and metadata_nonempty_step_count == metadata_ignored_step_count
+        and subgoal_enabled_step_count == 0
+        and landmark_enabled_step_count == 0
+    )
+    return {
+        "applicable": applicable,
+        "status": (
+            "PASS"
+            if applicable and passed
+            else "FAIL"
+            if applicable
+            else "LEGACY_UNVERSIONED"
+        ),
+        "protocol": protocol,
+        "expected_protocol": DISABLED_REWARD_METADATA_PROTOCOL,
+        "configured_subgoal_completion_reward": subgoal_reward,
+        "configured_landmark_deviation_penalty": landmark_penalty,
+        "subgoal_nonzero_rollout_count": subgoal_nonzero_rollout_count,
+        "landmark_nonzero_rollout_count": landmark_nonzero_rollout_count,
+        "detailed_step_count": detailed_step_count,
+        "diagnostic_protocol_counts": dict(
+            sorted(diagnostic_protocol_counts.items())
+        ),
+        "metadata_nonempty_step_count": metadata_nonempty_step_count,
+        "metadata_ignored_step_count": metadata_ignored_step_count,
+        "subgoal_enabled_step_count": subgoal_enabled_step_count,
+        "landmark_enabled_step_count": landmark_enabled_step_count,
+        "passed": passed,
+    }
+
+
 def _family_alignment(
     groups: Sequence[Sequence[Mapping[str, Any]]],
 ) -> Dict[str, Dict[str, Any]]:
@@ -639,6 +746,15 @@ def build_audit_report(run_dir: Path) -> Dict[str, Any]:
             "progress_scale": progress_scale,
             "navigation_weight": navigation_weight,
             "weighted_progress_scale": progress_scale * navigation_weight,
+            "reward_metadata_protocol": navigation_config.get(
+                "reward_metadata_protocol"
+            ),
+            "subgoal_completion_reward": navigation_config.get(
+                "subgoal_completion_reward"
+            ),
+            "landmark_deviation_penalty": navigation_config.get(
+                "landmark_deviation_penalty"
+            ),
             "semantic_protocol": semantic_config.get("protocol"),
             "semantic_weight": semantic_config.get("weight"),
             "semantic_potential_scale": semantic_config.get("potential_scale"),
@@ -699,6 +815,10 @@ def build_audit_report(run_dir: Path) -> Dict[str, Any]:
         "reward_families": _family_statistics(complete_rows),
         "reward_components": _component_statistics(complete_rows),
         "thought_diagnostics": _thought_diagnostic_statistics(complete_rows),
+        "reward_metadata_contract": _reward_metadata_contract(
+            complete_rows,
+            navigation_config,
+        ),
         "success_failure_preference": _success_failure_preference(groups),
         "clean_all_fail_alignment": {
             "final_distance": final_alignment,
@@ -724,6 +844,7 @@ def evaluate_targets(
     report: Mapping[str, Any],
     *,
     minimum_clean_all_fail_groups: int,
+    require_reward_metadata_contract: bool = False,
 ) -> List[str]:
     failures: List[str] = []
     clean_count = int(report["protocol"]["clean_all_fail_group_count"])
@@ -749,6 +870,20 @@ def evaluate_targets(
     if not bool(telescoping.get("passed")):
         failures.append(
             "sampled trajectory potential-telescoping audit did not pass"
+        )
+    metadata_contract = report["reward_metadata_contract"]
+    if bool(metadata_contract.get("applicable")) and not bool(
+        metadata_contract.get("passed")
+    ):
+        failures.append(
+            "reward_metadata disabled contract did not pass: "
+            f"{metadata_contract}"
+        )
+    elif require_reward_metadata_contract and not bool(
+        metadata_contract.get("applicable")
+    ):
+        failures.append(
+            "run manifest predates the versioned reward_metadata contract"
         )
     return failures
 
@@ -785,6 +920,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=20,
     )
+    parser.add_argument(
+        "--require-reward-metadata-contract",
+        action="store_true",
+        help=(
+            "require a versioned disabled reward_metadata contract; use for "
+            "phase-six acceptance while retaining legacy-run audit support"
+        ),
+    )
     return parser
 
 
@@ -802,6 +945,9 @@ def main() -> None:
     failures = evaluate_targets(
         report,
         minimum_clean_all_fail_groups=args.minimum_clean_all_fail_groups,
+        require_reward_metadata_contract=(
+            args.require_reward_metadata_contract
+        ),
     )
     report["acceptance"] = {
         "enforced": bool(args.enforce_targets),

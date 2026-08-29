@@ -37,6 +37,7 @@ from grpo_training import (  # noqa: E402
 )
 from lora_policy import LoRAPolicyConfig  # noqa: E402
 from navigation_rewards import (  # noqa: E402
+    DISABLED_REWARD_METADATA_PROTOCOL,
     CompositeRewardConfig,
     NavigationRewardConfig,
     SemanticRewardConfig,
@@ -353,6 +354,7 @@ def build_reward_config(args: argparse.Namespace) -> CompositeRewardConfig:
     return CompositeRewardConfig(
         navigation=NavigationRewardConfig(
             progress_scale=args.navigation_progress_scale,
+            reward_metadata_protocol=args.reward_metadata_protocol,
         ),
         semantic=SemanticRewardConfig(
             potential_scale=args.semantic_potential_scale,
@@ -473,6 +475,17 @@ def build_parser() -> argparse.ArgumentParser:
             "scale for the distance-potential progress reward: each moved "
             "transition receives scale * (previous_distance - "
             "current_distance); recorded in the immutable run manifest"
+        ),
+    )
+    parser.add_argument(
+        "--reward-metadata-protocol",
+        choices=(DISABLED_REWARD_METADATA_PROTOCOL,),
+        default=DISABLED_REWARD_METADATA_PROTOCOL,
+        help=(
+            "versioned navigation metadata-reward contract; R2R has no "
+            "grounded subgoal/landmark viewpoint annotations, so the only "
+            "supported protocol explicitly disables both rewards and records "
+            "that decision in the immutable run manifest"
         ),
     )
     parser.add_argument(

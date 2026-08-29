@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Protocol, Sequence, S
 import numpy as np
 
 from policy_output import BACK_TRACE_NAME, FINISH_ACTION, MAKE_ACTION_NAME
+from reward_metadata_contract import DISABLED_REWARD_METADATA_PROTOCOL
 from rl_env import NavigationTransition, RewardResult
 
 
@@ -48,11 +49,12 @@ class NavigationRewardConfig:
     weight: float = 1.0
     progress_shaping: str = DISTANCE_POTENTIAL_PROGRESS_SHAPING
     progress_scale: float = 5.0
+    reward_metadata_protocol: str = DISABLED_REWARD_METADATA_PROTOCOL
     revisit_penalty: float = -10.0
     invalid_streak_length: int = 3
     invalid_streak_penalty: float = -20.0
-    landmark_deviation_penalty: float = -50.0
-    subgoal_completion_reward: float = 30.0
+    landmark_deviation_penalty: float = 0.0
+    subgoal_completion_reward: float = 0.0
     success_reward: float = 200.0
     failure_penalty: float = -80.0
     enforce_failure_return_ceiling: bool = True
@@ -65,6 +67,12 @@ class NavigationRewardConfig:
             raise ValueError(
                 "progress_shaping must be "
                 f"{DISTANCE_POTENTIAL_PROGRESS_SHAPING!r}"
+            )
+        if self.reward_metadata_protocol != DISABLED_REWARD_METADATA_PROTOCOL:
+            raise ValueError(
+                "reward_metadata_protocol must be "
+                f"{DISABLED_REWARD_METADATA_PROTOCOL!r} until versioned "
+                "grounded viewpoint annotations exist"
             )
         _require_nonnegative("progress_scale", self.progress_scale)
         if (
@@ -99,6 +107,16 @@ class NavigationRewardConfig:
             self.landmark_deviation_penalty,
         )
         _require_nonpositive("failure_penalty", self.failure_penalty)
+        if self.subgoal_completion_reward != 0.0:
+            raise ValueError(
+                "subgoal_completion_reward must be zero while "
+                "reward_metadata is disabled"
+            )
+        if self.landmark_deviation_penalty != 0.0:
+            raise ValueError(
+                "landmark_deviation_penalty must be zero while "
+                "reward_metadata is disabled"
+            )
 
 
 @dataclass(frozen=True)
@@ -285,14 +303,7 @@ class CompositeRewardCalculator:
         """Clear all episode-local counters and one-shot rewards."""
 
         self._invalid_streak = 0
-        self._completed_subgoals: Set[str] = set()
-        self._landmark_penalty_applied = False
         self._episode_component_sum = 0.0
-        if initial_observation is not None:
-            metadata = _reward_metadata(initial_observation)
-            start = str(initial_observation.get("viewpoint", ""))
-            if start and start in _metadata_ids(metadata, "subgoal_viewpoints"):
-                self._completed_subgoals.add(start)
 
     def validate_visual_feature_provider(self, provider: Any) -> None:
         _validate_visual_feature_provider(
@@ -459,24 +470,25 @@ class CompositeRewardCalculator:
                 config.weight * config.invalid_streak_penalty
             )
 
-        metadata = _reward_metadata(transition.current_observation)
-        subgoals = _metadata_ids(metadata, "subgoal_viewpoints")
-        newly_completed = {
-            viewpoint
-            for viewpoint in transition.moved_path
-            if viewpoint in subgoals
-            and viewpoint not in self._completed_subgoals
-        }
-        if newly_completed:
-            self._completed_subgoals.update(newly_completed)
-            components["navigation/subgoal_completion"] = (
-                config.weight
-                * config.subgoal_completion_reward
-                * len(newly_completed)
-            )
-        diagnostics["navigation/new_subgoals"] = sorted(newly_completed)
-        diagnostics["navigation/completed_subgoal_count"] = len(
-            self._completed_subgoals
+        raw_metadata = transition.current_observation.get("reward_metadata")
+        metadata_nonempty = (
+            bool(raw_metadata)
+            if isinstance(raw_metadata, Mapping)
+            else raw_metadata is not None
+        )
+        diagnostics.update(
+            {
+                "navigation/reward_metadata_protocol": (
+                    config.reward_metadata_protocol
+                ),
+                "navigation/reward_metadata_present": (
+                    "reward_metadata" in transition.current_observation
+                ),
+                "navigation/reward_metadata_nonempty": metadata_nonempty,
+                "navigation/reward_metadata_ignored": metadata_nonempty,
+                "navigation/subgoal_completion_enabled": False,
+                "navigation/landmark_deviation_enabled": False,
+            }
         )
 
         if transition.success:
@@ -488,20 +500,6 @@ class CompositeRewardCalculator:
             components["navigation/failure"] = (
                 config.weight * config.failure_penalty
             )
-
-        landmarks = _metadata_ids(metadata, "key_landmark_viewpoints")
-        missing_landmarks = landmarks.difference(transition.visited_viewpoints)
-        diagnostics["navigation/landmark_annotation_available"] = bool(landmarks)
-        diagnostics["navigation/missing_landmark_count"] = len(missing_landmarks)
-        if (
-            episode_ended
-            and missing_landmarks
-            and not self._landmark_penalty_applied
-        ):
-            components["navigation/landmark_deviation"] = (
-                config.weight * config.landmark_deviation_penalty
-            )
-            self._landmark_penalty_applied = True
 
     def _semantic_reward(
         self,
@@ -774,27 +772,6 @@ def _validate_visual_feature_provider(
                 f"Instruction and visual CLIP {attribute} values differ: "
                 f"{instruction_value!r} versus {visual_value!r}"
             )
-
-
-def _reward_metadata(observation: Mapping[str, Any]) -> Mapping[str, Any]:
-    metadata = observation.get("reward_metadata", {})
-    if metadata is None:
-        return {}
-    if not isinstance(metadata, Mapping):
-        raise RewardConfigurationError("reward_metadata must be a mapping")
-    return metadata
-
-
-def _metadata_ids(metadata: Mapping[str, Any], name: str) -> Set[str]:
-    raw_values = metadata.get(name, ())
-    if raw_values is None:
-        return set()
-    if isinstance(raw_values, str) or not isinstance(raw_values, Sequence):
-        raise RewardConfigurationError(f"reward_metadata.{name} must be a list")
-    values = {str(value) for value in raw_values}
-    if any(not value for value in values):
-        raise RewardConfigurationError(f"reward_metadata.{name} contains an empty ID")
-    return values
 
 
 def _feature_vector(value: Any, name: str) -> np.ndarray:

@@ -1106,6 +1106,7 @@ def build_grpo_run_manifest(
                 "r2r_evaluation.py",
                 "rl_env.py",
                 "navigation_rewards.py",
+                "reward_metadata_contract.py",
                 "navigation_state.py",
                 "policy_output.py",
                 "clip_feature_cache.py",

@@ -1,4 +1,4 @@
-"""Deterministically validate stage-four rewards without loading CLIP/LLMs."""
+"""Deterministically validate composite rewards without loading CLIP/LLMs."""
 
 from __future__ import annotations
 
@@ -35,6 +35,7 @@ from navigation_rewards import (  # noqa: E402
     BOUNDED_RAW_VISUAL_SEMANTIC_REWARD,
     COMPONENT_NAMES,
     DIAGNOSTIC_ONLY_SUBGOAL_ALIGNMENT,
+    DISABLED_REWARD_METADATA_PROTOCOL,
     DISTANCE_POTENTIAL_PROGRESS_SHAPING,
     GROUNDED_AUXILIARY_THOUGHT_REWARD,
     CompositeRewardCalculator,
@@ -236,13 +237,32 @@ def validate_navigation_reward() -> None:
         "Moved transition was not marked as progress-bearing",
     )
     require(
-        result.components["navigation/subgoal_completion"] == 30.0,
-        "Wrong one-shot subgoal reward",
+        result.components["navigation/subgoal_completion"] == 0.0,
+        "Ungrounded subgoal metadata activated a reward",
+    )
+    require(
+        result.components["navigation/landmark_deviation"] == 0.0,
+        "Ungrounded landmark metadata activated a penalty",
+    )
+    require(
+        result.diagnostics["navigation/reward_metadata_protocol"]
+        == DISABLED_REWARD_METADATA_PROTOCOL,
+        "Navigation diagnostics omitted the disabled metadata protocol",
+    )
+    require(
+        result.diagnostics["navigation/reward_metadata_nonempty"] is True
+        and result.diagnostics["navigation/reward_metadata_ignored"] is True,
+        "Injected metadata was not explicitly recorded as ignored",
+    )
+    require(
+        result.diagnostics["navigation/subgoal_completion_enabled"] is False
+        and result.diagnostics["navigation/landmark_deviation_enabled"] is False,
+        "Metadata-dependent reward diagnostics were not explicitly disabled",
     )
     second = calculator(transition(reward_metadata=metadata))
     require(
         second.components["navigation/subgoal_completion"] == 0.0,
-        "Subgoal reward was paid twice",
+        "Ungrounded subgoal metadata activated on a later transition",
     )
 
     revisit = calculator(
@@ -363,7 +383,7 @@ def validate_navigation_reward() -> None:
     require(success.components["navigation/failure"] == 0.0,
             "Success also received failure penalty")
     require(success.components["navigation/landmark_deviation"] == 0.0,
-            "Visited landmark was marked missing")
+            "Disabled landmark reward activated on success")
 
     calculator.reset()
     failure = calculator(
@@ -380,8 +400,8 @@ def validate_navigation_reward() -> None:
     )
     require(failure.components["navigation/failure"] == -80.0,
             "Wrong terminal failure penalty")
-    require(failure.components["navigation/landmark_deviation"] == -50.0,
-            "Missing annotated landmark was not penalized")
+    require(failure.components["navigation/landmark_deviation"] == 0.0,
+            "Disabled landmark reward activated on failure")
 
 
 def validate_semantic_reward() -> None:
@@ -678,7 +698,7 @@ def validate_composition_and_factory() -> None:
     )
     require(tuple(result.components) == COMPONENT_NAMES,
             "Reward component schema is unstable")
-    require(math.isclose(sum(result.components.values()), 45.25),
+    require(math.isclose(sum(result.components.values()), 15.25),
             "Composite reward sum is wrong")
 
     environment = object.__new__(NavGPTGymEnv)
@@ -707,6 +727,9 @@ def validate_composition_and_factory() -> None:
         lambda: NavigationRewardConfig(progress_scale=-1.0),
         lambda: NavigationRewardConfig(progress_shaping="binary_positive"),
         lambda: NavigationRewardConfig(invalid_streak_length=True),
+        lambda: NavigationRewardConfig(reward_metadata_protocol="legacy"),
+        lambda: NavigationRewardConfig(subgoal_completion_reward=30.0),
+        lambda: NavigationRewardConfig(landmark_deviation_penalty=-50.0),
         lambda: SemanticRewardConfig(potential_scale=float("inf")),
         lambda: SemanticRewardConfig(protocol="legacy"),
         lambda: SemanticRewardConfig(max_terminal_reward_fraction=0.0),
@@ -908,8 +931,9 @@ def main() -> None:
     validate_composition_and_factory()
     validate_feature_stores()
     validate_color_and_text_lru()
-    print("PASS stage-four composite rewards")
-    print("- navigation progress/revisit/invalid/subgoal/landmark/terminal rewards")
+    print("PASS composite rewards and stage-six reward-metadata contract")
+    print("- navigation progress/revisit/invalid/terminal rewards")
+    print("- ungrounded subgoal/landmark viewpoint rewards are protocol-disabled")
     print("- cycle-safe raw-visual CLIP potential shaping")
     print("- grounded auxiliary thought action/fact reward and subgoal diagnostics")
     print("- per-rollout state isolation and diagnostic/reward separation")

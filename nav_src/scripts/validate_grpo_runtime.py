@@ -42,6 +42,7 @@ from navigation_rewards import (  # noqa: E402
     BOUNDED_RAW_VISUAL_SEMANTIC_REWARD,
     CompositeRewardConfig,
     DIAGNOSTIC_ONLY_SUBGOAL_ALIGNMENT,
+    DISABLED_REWARD_METADATA_PROTOCOL,
     DISTANCE_POTENTIAL_PROGRESS_SHAPING,
     GROUNDED_AUXILIARY_THOUGHT_REWARD,
     NavigationRewardConfig,
@@ -976,6 +977,7 @@ def validate_run_manifest_model_binding(root: Path) -> None:
     cli_reward_config = build_reward_config(
         SimpleNamespace(
             navigation_progress_scale=3.25,
+            reward_metadata_protocol=DISABLED_REWARD_METADATA_PROTOCOL,
             semantic_potential_scale=12.0,
             thought_reward_weight=0.125,
         )
@@ -983,6 +985,11 @@ def validate_run_manifest_model_binding(root: Path) -> None:
     require(
         cli_reward_config.navigation.progress_scale == 3.25,
         "Training CLI did not propagate the navigation progress scale",
+    )
+    require(
+        cli_reward_config.navigation.reward_metadata_protocol
+        == DISABLED_REWARD_METADATA_PROTOCOL,
+        "Training CLI did not propagate the reward_metadata protocol",
     )
     require(
         cli_reward_config.semantic.potential_scale == 12.0,
@@ -1029,6 +1036,13 @@ def validate_run_manifest_model_binding(root: Path) -> None:
     require(
         recorded_navigation_reward["progress_scale"] == 5.0,
         "Run manifest omitted the navigation progress scale",
+    )
+    require(
+        recorded_navigation_reward["reward_metadata_protocol"]
+        == DISABLED_REWARD_METADATA_PROTOCOL
+        and recorded_navigation_reward["subgoal_completion_reward"] == 0.0
+        and recorded_navigation_reward["landmark_deviation_penalty"] == 0.0,
+        "Run manifest omitted the explicit disabled reward_metadata contract",
     )
     recorded_semantic_reward = first["environment"]["component_config"][
         "reward_config"
